@@ -27,6 +27,7 @@ with open(os.path.join(_HERE, 'config.json')) as _f:
     _cfg = json.load(_f)
 
 STATION      = _cfg['station']
+STATION_NAME = _cfg.get('station_name', STATION).upper()
 PLATFORM     = str(_cfg['platform'])
 API_KEY      = _cfg['api_key']
 REFRESH_SEC  = int(_cfg.get('refresh_interval', 30))
@@ -210,8 +211,9 @@ def _render(rows, loading, blink):
     screen.fill(C['bg'])
     y = 10
 
-    # Clock — top right, dim orange
+    # Station name — top left, clock — top right, both dim orange
     clock_str = datetime.now(LA_TZ).strftime('%I:%M:%S %p')
+    _blit_left(STATION_NAME, font_xs, C['dim'], PAD, y)
     _, ch = _blit_right(clock_str, font_xs, C['dim'], W - PAD, y)
     y += ch + 8
 
