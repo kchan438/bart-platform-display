@@ -80,21 +80,21 @@ def _fetch():
             e for e in estimates_raw
             if str(e.get('platform', '')) == PLATFORM
         ]
-        # Prefer non-cancelled; fall back to first if all cancelled
-        first = next((e for e in pool if e.get('cancelflag', '0') != '1'), None)
-        if first is None:
-            first = pool[0] if pool else None
-        if first is None:
+        valid = [e for e in pool if e.get('cancelflag', '0') != '1'] or pool
+        if not valid:
             continue
-
+        valid.sort(key=lambda e: (
+            0 if e.get('minutes') in ('Leaving', '0')
+            else (int(e['minutes']) if str(e.get('minutes', '')).isdigit() else 999)
+        ))
         rows.append({
             'destination': etd.get('destination', '').upper(),
-            'minutes':     first.get('minutes', ''),
+            'minutes':     [e.get('minutes', '') for e in valid[:3]],
         })
 
     rows.sort(key=lambda r: (
-        0 if r['minutes'] in ('Leaving', '0')
-        else (int(r['minutes']) if r['minutes'].isdigit() else 999)
+        0 if r['minutes'][0] in ('Leaving', '0')
+        else (int(r['minutes'][0]) if r['minutes'][0].isdigit() else 999)
     ))
     return rows
 
@@ -166,13 +166,14 @@ if not os.path.exists(_FONT_PATH):
     pygame.quit()
     sys.exit(1)
 
-font_xs  = pygame.font.Font(_FONT_PATH,  7)
-font_sm  = pygame.font.Font(_FONT_PATH,  9)
-font_med = pygame.font.Font(_FONT_PATH, 11)
+font_xs  = pygame.font.Font(_FONT_PATH,  9)
+font_sm  = pygame.font.Font(_FONT_PATH, 11)
+font_med = pygame.font.Font(_FONT_PATH, 14)
 
-PAD   = 14   # horizontal padding (px)
-ROW_H = 38   # height of each departure row (px)
-FPS   = 10   # render loop rate — low enough to spare the Pi Zero W's CPU
+PAD     = 14   # horizontal padding (px)
+ROW_H   = 46   # height of each departure row (px)
+FPS     = 10   # render loop rate — low enough to spare the Pi Zero W's CPU
+_SLOT_W = font_med.size('NOW')[0] + 14  # width of each estimate column
 
 # ---------------------------------------------------------------------------
 # Drawing helpers
@@ -228,34 +229,30 @@ def _render(rows, loading, blink):
 
     if loading:
         _blit_left('LOADING...', font_sm, C['dim'], PAD, y)
+    elif not rows:
+        _blit_left('NO SERVICE', font_sm, C['ghost'], PAD, y)
     else:
-        arriving = [r for r in rows if r['minutes'] in ('Leaving', '0')]
-        upcoming = [r for r in rows if r['minutes'] not in ('Leaving', '0')][:5]
+        for row in rows[:5]:
+            mins   = row['minutes']
+            is_now = mins[0] in ('Leaving', '0')
+            text_y = y + (ROW_H - font_med.get_height()) // 2
 
-        # Blinking "NOW ARRIVING" banners
-        for row in arriving:
-            if blink:
-                pygame.draw.rect(screen, C['arrive_bg'], (0, y, W, ROW_H))
-                now_w  = font_med.size('NOW')[0]
-                max_dw = W - PAD * 2 - now_w - 20
-                dest   = _truncate(f'> {row["destination"]}', font_med, max_dw)
-                _blit_left(dest, font_med, C['arrive'], PAD, y + 10)
-                _blit_right('NOW', font_med, C['arrive'], W - PAD, y + 10)
+            # Destination — flashes yellow when now arriving, else orange
+            dest_color = C['arrive'] if (is_now and blink) else C['on']
+            max_dest_w = W - PAD * 2 - _SLOT_W * 3 - 8
+            dest = _truncate(row['destination'], font_med, max_dest_w)
+            _blit_left(dest, font_med, dest_color, PAD, text_y)
+
+            # Up to 3 estimates in ascending slots (soonest leftmost)
+            for i, m in enumerate(mins):
+                slot_right = W - PAD - (2 - i) * _SLOT_W
+                if m in ('Leaving', '0'):
+                    color = C['arrive'] if blink else C['dim']
+                    _blit_right('NOW', font_med, color, slot_right, text_y)
+                else:
+                    _blit_right(m, font_med, C['on'], slot_right, text_y)
+
             y += ROW_H
-
-        # Upcoming departures
-        if not arriving and not upcoming:
-            _blit_left('NO SERVICE', font_sm, C['ghost'], PAD, y)
-        else:
-            for i, row in enumerate(upcoming):
-                color   = C['dim'] if i >= 4 else C['on']
-                min_txt = f'{row["minutes"]} MIN'
-                min_w   = font_med.size(min_txt)[0]
-                max_dw  = W - PAD * 2 - min_w - 20
-                dest    = _truncate(row['destination'], font_med, max_dw)
-                _blit_left(dest,    font_med, color, PAD,       y + 10)
-                _blit_right(min_txt, font_med, color, W - PAD,  y + 10)
-                y += ROW_H
 
     # Footer
     footer_y = H - 22
