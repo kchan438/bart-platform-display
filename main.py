@@ -166,12 +166,12 @@ if not os.path.exists(_FONT_PATH):
     pygame.quit()
     sys.exit(1)
 
-font_xs  = pygame.font.Font(_FONT_PATH,  9)
-font_sm  = pygame.font.Font(_FONT_PATH, 11)
-font_med = pygame.font.Font(_FONT_PATH, 14)
+font_xs  = pygame.font.Font(_FONT_PATH, 11)
+font_sm  = pygame.font.Font(_FONT_PATH, 13)
+font_med = pygame.font.Font(_FONT_PATH, 17)
 
 PAD     = 14   # horizontal padding (px)
-ROW_H   = 46   # height of each departure row (px)
+ROW_H   = 54   # height of each departure row (px)
 FPS     = 10   # render loop rate — low enough to spare the Pi Zero W's CPU
 _SLOT_W = font_med.size('NOW')[0] + 14  # width of each estimate column
 
@@ -232,7 +232,7 @@ def _render(rows, loading, blink):
     elif not rows:
         _blit_left('NO SERVICE', font_sm, C['ghost'], PAD, y)
     else:
-        for row in rows[:5]:
+        for row in rows[:4]:
             mins   = row['minutes']
             is_now = mins[0] in ('Leaving', '0')
             text_y = y + (ROW_H - font_med.get_height()) // 2
