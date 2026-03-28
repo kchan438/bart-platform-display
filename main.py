@@ -4,16 +4,17 @@ import sys
 # Must be set before pygame is imported so SDL targets the TFT framebuffer.
 # On the Pi Zero W the SPI TFT display is mapped to /dev/fb1 by the fbtft driver.
 # When running on a desktop for development, unset these or override via env.
-os.environ.setdefault('SDL_VIDEODRIVER', 'fbcon')
-os.environ.setdefault('SDL_FBDEV',       '/dev/fb1')
+os.environ.setdefault('SDL_VIDEODRIVER', 'offscreen')
 os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')   # suppress audio errors
 
 import json
+import mmap
 import threading
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pygame
 import requests
 
@@ -132,6 +133,28 @@ W, H   = 480, 320
 screen = pygame.display.set_mode((W, H), pygame.NOFRAME)
 pygame.mouse.set_visible(False)
 
+# Framebuffer — write rendered frames to /dev/fb0 (RGB565, 16-bit)
+_fb_file = None
+_fb_mmap = None
+try:
+    _fb_file = open('/dev/fb0', 'rb+')
+    _fb_mmap = mmap.mmap(_fb_file.fileno(), W * H * 2)
+except OSError as _e:
+    print(f'[display] /dev/fb0 not available ({_e}) — running headless', file=sys.stderr)
+
+
+def _flush_to_fb(surface):
+    if _fb_mmap is None:
+        return
+    arr = pygame.surfarray.array3d(surface)   # (W, H, 3) uint8, column-major
+    arr = arr.transpose(1, 0, 2)              # (H, W, 3) row-major
+    r = arr[:, :, 0].astype(np.uint16)
+    g = arr[:, :, 1].astype(np.uint16)
+    b = arr[:, :, 2].astype(np.uint16)
+    rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+    _fb_mmap.seek(0)
+    _fb_mmap.write(rgb565.tobytes())
+
 _FONT_PATH = os.path.join(_HERE, 'fonts', 'PressStart2P-Regular.ttf')
 if not os.path.exists(_FONT_PATH):
     print(
@@ -238,7 +261,7 @@ def _render(rows, loading, blink):
     _blit_left('BART',              font_xs, C['ghost'], PAD,    footer_y)
     _blit_right(f'PLATFORM {PLATFORM}', font_xs, C['white'], W - PAD, footer_y)
 
-    pygame.display.flip()
+    _flush_to_fb(screen)
 
 
 # ---------------------------------------------------------------------------
