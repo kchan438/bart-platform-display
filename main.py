@@ -89,7 +89,7 @@ def _fetch():
         ))
         rows.append({
             'destination': etd.get('destination', '').upper(),
-            'minutes':     [e.get('minutes', '') for e in valid[:3]],
+            'minutes':     [e.get('minutes', '') for e in valid[:2]],
         })
 
     rows.sort(key=lambda r: (
@@ -239,13 +239,13 @@ def _render(rows, loading, blink):
 
             # Destination — flashes yellow when now arriving, else orange
             dest_color = C['arrive'] if (is_now and blink) else C['on']
-            max_dest_w = W - PAD * 2 - _SLOT_W * 3 - 8
+            max_dest_w = W - PAD * 2 - _SLOT_W * 2 - 8
             dest = _truncate(row['destination'], font_med, max_dest_w)
             _blit_left(dest, font_med, dest_color, PAD, text_y)
 
             # Up to 3 estimates in ascending slots (soonest leftmost)
             for i, m in enumerate(mins):
-                slot_right = W - PAD - (2 - i) * _SLOT_W
+                slot_right = W - PAD - (1 - i) * _SLOT_W
                 if m in ('Leaving', '0'):
                     color = C['arrive'] if blink else C['dim']
                     _blit_right('NOW', font_med, color, slot_right, text_y)
