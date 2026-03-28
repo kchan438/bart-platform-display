@@ -5,7 +5,7 @@ import sys
 # On the Pi Zero W the SPI TFT display is mapped to /dev/fb1 by the fbtft driver.
 # When running on a desktop for development, unset these or override via env.
 os.environ.setdefault('SDL_VIDEODRIVER', 'fbcon')
-os.environ.setdefault('SDL_FBDEV',       '/dev/fb1')
+os.environ.setdefault('SDL_FBDEV',       '/dev/fb0')
 os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')   # suppress audio errors
 
 import json

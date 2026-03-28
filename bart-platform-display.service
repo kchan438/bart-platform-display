@@ -8,7 +8,7 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/bart-platform-display
 Environment=SDL_VIDEODRIVER=fbcon
-Environment=SDL_FBDEV=/dev/fb1
+Environment=SDL_FBDEV=/dev/fb0
 Environment=SDL_AUDIODRIVER=dummy
 ExecStart=/home/pi/bart-platform-display/venv/bin/python main.py
 Restart=always
