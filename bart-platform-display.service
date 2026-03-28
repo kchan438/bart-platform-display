@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/bart-platform-display
+User=kevinchan
+WorkingDirectory=/home/kevinchan/bart-platform-display
 Environment=SDL_VIDEODRIVER=offscreen
 Environment=SDL_AUDIODRIVER=dummy
-ExecStart=/home/pi/bart-platform-display/venv/bin/python main.py
+ExecStart=/home/kevinchan/bart-platform-display/venv/bin/python main.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
