@@ -168,7 +168,7 @@ if not os.path.exists(_FONT_PATH):
 
 font_xs  = pygame.font.Font(_FONT_PATH, 17)
 font_sm  = pygame.font.Font(_FONT_PATH, 20)
-font_med = pygame.font.Font(_FONT_PATH, 26)
+font_med = pygame.font.Font(_FONT_PATH, 24)
 
 PAD     = 14   # horizontal padding (px)
 ROW_H   = 50   # height of each departure row (px)
