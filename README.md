@@ -6,8 +6,8 @@ Displays real-time BART Platform 2 departures for a configured station.
 ## Hardware
 
 - Raspberry Pi Zero W
-- 3.5" SPI TFT LCD (480x320, GPIO HAT, driver mapped to `/dev/fb1`)
-- 32-bit Raspberry Pi OS Lite
+- 3.5" SPI TFT LCD (480x320, GPIO HAT, ILI9486 driver, XPT2046 touch, mapped to `/dev/fb0`)
+- Raspbian GNU/Linux 13 (trixie), 32-bit
 
 SSH remains enabled so you can modify the project remotely at any time.
 
@@ -29,30 +29,74 @@ bart-platform-display/
 
 ## 1 — Configure your TFT display
 
-Before running the app your display driver must be loaded so the screen appears
-as `/dev/fb1`. How to do this depends on your display model.
+The display driver must be loaded before running the app so the screen appears as `/dev/fb0`.
 
-**Waveshare 3.5" (Type A/B, ILI9486):**
-Follow the official Waveshare wiki driver install instructions for your model.
-After install, reboot and confirm `/dev/fb1` exists:
+### Install lcd-show
+
+Clone the lcd-show driver repo:
+
+```bash
+git clone https://github.com/goodtft/LCD-show.git ~/LCD-show
+cd ~/LCD-show
+sudo ./LCD35-show
+```
+
+The Pi reboots automatically. After reboot the driver will have written `dtoverlay=waveshare35a`
+to `/boot/config.txt` — but on Raspbian trixie this is **the wrong file**. See the note below.
+
+### Important: Raspbian trixie uses a different config path
+
+On Raspbian 13 (trixie) the firmware reads from `/boot/firmware/config.txt`, not `/boot/config.txt`.
+The lcd-show script doesn't know this and edits the wrong file, so the overlay never loads.
+
+After running lcd-show and rebooting, check if `dtoverlay=waveshare35a` is in the right place:
+
+```bash
+grep waveshare /boot/firmware/config.txt
+```
+
+If it's missing, add it manually:
+
+```bash
+sudo nano /boot/firmware/config.txt
+```
+
+Add `dtoverlay=waveshare35a` at the bottom (keep `dtparam=spi=on` — it should already be there),
+then reboot.
+
+After reboot confirm the framebuffer exists:
 
 ```bash
 ls /dev/fb*
 ```
 
-You should see both `/dev/fb0` (HDMI) and `/dev/fb1` (TFT).
+You should see `/dev/fb0` (the TFT). On trixie there is no HDMI framebuffer — the TFT takes `fb0`.
+
+### Disable the framebuffer console on the TFT
+
+By default the Linux console (login prompt) renders to `fb0`, which conflicts with the app.
+Disable it by adding `fbcon=map:10` to the kernel command line:
+
+```bash
+sudo nano /boot/firmware/cmdline.txt
+```
+
+Append `fbcon=map:10` to the end of the existing single line (do not add a new line), then reboot.
+After this the TFT will show a blank screen at boot — that is correct.
 
 ---
 
 ## 2 — Copy the project to the Pi
 
-From your dev machine:
-
 ```bash
-scp -r bart-platform-display pi@<PI_IP>:/home/pi/
+git clone <this repo> ~/bart-platform-display
 ```
 
-Or clone/copy however you prefer.
+Or SCP from your dev machine:
+
+```bash
+scp -r bart-platform-display <user>@<PI_IP>:/home/<user>/
+```
 
 ---
 
@@ -66,7 +110,6 @@ The app requires **Press Start 2P** (a free, open-source pixel font).
 4. Place it at `fonts/PressStart2P-Regular.ttf` inside the project folder
 
 ```bash
-# On the Pi, from inside the project directory:
 ls fonts/PressStart2P-Regular.ttf   # should exist
 ```
 
@@ -74,30 +117,21 @@ ls fonts/PressStart2P-Regular.ttf   # should exist
 
 ## 4 — Install dependencies
 
-SSH into the Pi, then:
-
 ```bash
-cd /home/pi/bart-platform-display
-
+cd ~/bart-platform-display
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-pygame's pip install builds from source on 32-bit Pi OS — it will take a few
-minutes. If it fails, install the system package instead:
+pygame installs via piwheels (pre-built wheel) so it should be fast. If it fails, install the
+system package instead:
 
 ```bash
 sudo apt install python3-pygame
-```
-
-Then remove `pygame` from `requirements.txt` and create the venv with
-`--system-site-packages`:
-
-```bash
 python3 -m venv --system-site-packages venv
 source venv/bin/activate
-pip install requests
+pip install requests numpy
 ```
 
 ---
@@ -105,21 +139,12 @@ pip install requests
 ## 5 — Test manually
 
 ```bash
-cd /home/pi/bart-platform-display
+cd ~/bart-platform-display
 source venv/bin/activate
 python main.py
 ```
 
-The TFT should show the departure board. Press `ESC` (if a keyboard is attached)
-or `Ctrl+C` in the terminal to exit.
-
-**Desktop/dev testing** (no TFT): override the SDL driver before running:
-
-```bash
-SDL_VIDEODRIVER='' SDL_FBDEV='' python main.py
-```
-
-This opens a normal pygame window on your desktop.
+The TFT should show the departure board. Press `Ctrl+C` to exit.
 
 ---
 
@@ -127,7 +152,7 @@ This opens a normal pygame window on your desktop.
 
 ```bash
 # Copy the service file
-sudo cp /home/pi/bart-platform-display/bart-platform-display.service \
+sudo cp ~/bart-platform-display/bart-platform-display.service \
         /etc/systemd/system/
 
 # Reload systemd and enable the service
@@ -156,6 +181,7 @@ Edit `config.json` to change the station or other settings:
 ```json
 {
   "station": "MONT",
+  "station_name": "Montgomery St.",
   "platform": "2",
   "api_key": "YOUR_BART_API_KEY",
   "refresh_interval": 30
@@ -165,6 +191,7 @@ Edit `config.json` to change the station or other settings:
 | Key                | Description                                      |
 |--------------------|--------------------------------------------------|
 | `station`          | BART station abbreviation (e.g. `MONT`, `EMBR`)  |
+| `station_name`     | Display name shown in the top-left corner        |
 | `platform`         | Platform number to display (`"1"` or `"2"`)      |
 | `api_key`          | Your BART API key                                |
 | `refresh_interval` | Seconds between API polls (default `30`)         |
@@ -181,8 +208,22 @@ sudo systemctl restart bart-platform-display
 
 | Symptom | Fix |
 |---------|-----|
-| Black screen on TFT | Check `/dev/fb1` exists; confirm display driver is installed |
+| `/dev/fb0` doesn't exist after reboot | lcd-show edited the wrong config file — manually add `dtoverlay=waveshare35a` to `/boot/firmware/config.txt` (not `/boot/config.txt`) and reboot |
+| Display shows login prompt / console text | Add `fbcon=map:10` to `/boot/firmware/cmdline.txt` and reboot |
+| `pygame.error: fbcon not available` | Expected on Raspbian trixie — SDL2 is built without fbcon/fbdev. The app uses `SDL_VIDEODRIVER=offscreen` and writes frames directly to `/dev/fb0` via mmap; no action needed |
+| Display stays white, `dd if=/dev/zero of=/dev/fb0` has no effect | fbcon is still active and overwriting the framebuffer — confirm `fbcon=map:10` is in `/boot/firmware/cmdline.txt` |
 | `Font not found` error | Place `PressStart2P-Regular.ttf` in `fonts/` |
-| `pygame.error: No available video device` | Confirm `SDL_VIDEODRIVER=fbcon` and `SDL_FBDEV=/dev/fb1` are set |
-| `LOADING...` stays forever | Check internet connectivity; run `journalctl -u bart-platform-display -f` for errors |
+| `LOADING...` stays forever | Check internet; run `journalctl -u bart-platform-display -f` for errors |
 | pip pygame build fails | Use system pygame: `sudo apt install python3-pygame` and create venv with `--system-site-packages` |
+
+---
+
+## How the framebuffer rendering works (Raspbian trixie)
+
+On Raspbian trixie, SDL2 is compiled without the legacy `fbcon`/`fbdev` video backends, so the
+standard approach of pointing SDL at the TFT with `SDL_VIDEODRIVER=fbcon` does not work.
+
+Instead the app uses `SDL_VIDEODRIVER=offscreen` to render into a memory surface, then after each
+frame converts the pixels from RGB24 to RGB565 (the TFT's native 16-bit format) using numpy and
+writes them directly to `/dev/fb0` via `mmap`. This bypasses SDL's display stack entirely and
+works regardless of which SDL2 backends are compiled in.
