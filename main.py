@@ -173,7 +173,8 @@ font_med = pygame.font.Font(_FONT_PATH, 24)
 PAD     = 14   # horizontal padding (px)
 ROW_H   = 50   # height of each departure row (px)
 FPS     = 10   # render loop rate — low enough to spare the Pi Zero W's CPU
-_SLOT_W = max(font_sm.size('NOW')[0], font_xs.size('MIN')[0]) + 14  # width of each estimate column
+_TIME_W = font_sm.size('NOW')[0] + 10   # width of each time-number column
+_MIN_W  = font_xs.size('MIN')[0]  + 10   # width of the shared MIN label column
 
 # ---------------------------------------------------------------------------
 # Drawing helpers
@@ -232,30 +233,30 @@ def _render(rows, loading, blink):
     elif not rows:
         _blit_left('NO SERVICE', font_sm, C['ghost'], PAD, y)
     else:
-        pair_h = font_sm.get_height() + 2 + font_xs.get_height()
+        time_y = 0  # computed per-row below
         for row in rows[:4]:
             mins   = row['minutes']
             is_now = mins[0] in ('Leaving', '0')
-            dest_y = y + (ROW_H - font_sm.get_height()) // 2
-            num_y  = y + (ROW_H - pair_h) // 2
-            min_y  = num_y + font_sm.get_height() + 2
+            dest_y = y + (ROW_H - font_xs.get_height()) // 2
+            time_y = y + (ROW_H - font_sm.get_height()) // 2
+            min_y  = y + (ROW_H - font_xs.get_height()) // 2
 
             # Destination — flashes yellow when now arriving, else orange
             dest_color = C['arrive'] if (is_now and blink) else C['on']
-            max_dest_w = W - PAD * 2 - _SLOT_W * 2 - 8
-            dest = _truncate(row['destination'], font_sm, max_dest_w)
-            _blit_left(dest, font_sm, dest_color, PAD, dest_y)
+            max_dest_w = W - PAD * 2 - _TIME_W * 2 - _MIN_W - 8
+            dest = _truncate(row['destination'], font_xs, max_dest_w)
+            _blit_left(dest, font_xs, dest_color, PAD, dest_y)
 
-            # Up to 2 estimates: number stacked above "MIN" label
+            # Two time columns, then a single shared MIN label at far right
             for i, m in enumerate(mins):
-                slot_right = W - PAD - (1 - i) * _SLOT_W
+                slot_right = W - PAD - _MIN_W - (1 - i) * _TIME_W
                 if m in ('Leaving', '0'):
-                    now_y = y + (ROW_H - font_sm.get_height()) // 2
                     color = C['arrive'] if blink else C['dim']
-                    _blit_right('NOW', font_sm, color, slot_right, now_y)
+                    _blit_right('NOW', font_sm, color, slot_right, time_y)
                 else:
-                    _blit_right(m,     font_sm, C['on'],  slot_right, num_y)
-                    _blit_right('MIN', font_xs, C['dim'], slot_right, min_y)
+                    _blit_right(m, font_sm, C['on'], slot_right, time_y)
+
+            _blit_right('MIN', font_xs, C['dim'], W - PAD, min_y)
 
             y += ROW_H
 
