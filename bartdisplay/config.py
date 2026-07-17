@@ -82,6 +82,11 @@ def get_show_touch_cursor():
     return True if v is None else bool(v)
 
 
+def set_show_touch_cursor(enabled):
+    """Persist the touch-cursor toggle to config.json."""
+    _write_field('show_touch_cursor', bool(enabled))
+
+
 def _write_field(key, value):
     """Read-modify-write config.json so unrelated fields are never dropped."""
     with _lock:

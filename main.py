@@ -50,7 +50,6 @@ def main():
     blink_ms = 0
     running = True
 
-    show_cursor = config.get_show_touch_cursor()
     cursor_pos = None
     cursor_active = False
     cursor_last = 0
@@ -58,7 +57,9 @@ def main():
 
     while running:
         now = pygame.time.get_ticks()
-        cursor_recent = cursor_pos is not None and (
+        # Read live so the settings toggle takes effect immediately.
+        show_cursor = config.get_show_touch_cursor()
+        cursor_recent = show_cursor and cursor_pos is not None and (
             cursor_active or now - cursor_last < CURSOR_LINGER)
         fps = FPS_ACTIVE if (panel.is_active() or cursor_recent) else FPS_IDLE
         dt = clock.tick(fps)
@@ -101,7 +102,7 @@ def main():
         rows, loading = departures.snapshot()
         board.render(rows, loading, blink)
         panel.render()
-        if show_cursor and cursor_recent:
+        if cursor_recent:
             display.draw_cursor(*cursor_pos, active=cursor_active)
         display.present()
 

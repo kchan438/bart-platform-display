@@ -193,14 +193,26 @@ class SettingsPanel:
         # grab-handle affordance
         pygame.draw.rect(self._surf, C['dim'], (W // 2 - 20, 6, 40, 4))
 
-        wifi_btn = Button((PAD, 70, W - 2 * PAD, 54), 'WI-FI',
+        wifi_btn = Button((PAD, 62, W - 2 * PAD, 50), 'WI-FI',
                           on_tap=lambda _b: self._goto('wifi'), font=display.font_sm)
-        api_btn = Button((PAD, 136, W - 2 * PAD, 54), 'BART API KEY',
+        api_btn = Button((PAD, 120, W - 2 * PAD, 50), 'BART API KEY',
                          on_tap=lambda _b: self._goto('apikey'), font=display.font_sm)
         wifi_btn.draw()
         api_btn.draw()
+
+        cursor_on = config.get_show_touch_cursor()
+        cursor_btn = Button(
+            (PAD, 178, W - 2 * PAD, 40),
+            'TOUCH CURSOR: ' + ('ON' if cursor_on else 'OFF'),
+            on_tap=lambda _b: self._toggle_cursor(), font=display.font_xs,
+            fg=(C['arrive'] if cursor_on else C['dim']))
+        cursor_btn.draw()
+
         display.blit_center('Swipe up to close', display.font_xs, C['ghost'], W // 2, H - 24)
-        self._buttons = [wifi_btn, api_btn]
+        self._buttons = [wifi_btn, api_btn, cursor_btn]
+
+    def _toggle_cursor(self):
+        config.set_show_touch_cursor(not config.get_show_touch_cursor())
 
     # -- Wi-Fi list ---------------------------------------------------------
     def _render_wifi(self):
