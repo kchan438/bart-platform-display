@@ -293,12 +293,32 @@ class SettingsPanel:
             self._buttons = self._header('NETWORK', back_to='wifi')
             return
         btns = self._header('NETWORK', back_to='wifi')
-        y = _HEADER_H + 8
+
+        # Prominent, color-coded SSID title (yellow when connected).
+        title_color = C['arrive'] if net.active else C['on']
+        display.blit_center(display.truncate(net.ssid, display.font_sm, W - 2 * PAD),
+                            display.font_sm, title_color, W // 2, _HEADER_H + 8)
+
+        y = _HEADER_H + 40
         for label, value in self.detail_info:
-            display.blit_left(label, display.font_xs, C['dim'], PAD, y)
-            val = display.truncate(str(value), display.font_xs, W - PAD - 130)
-            display.blit_right(val, display.font_xs, C['white'], W - PAD, y)
-            y += 22
+            if label == 'SSID':
+                continue  # shown as the title above
+            color = self._detail_color(label, value, net)
+            # left accent dot in the value's color, then the dim label
+            pygame.draw.rect(self._surf, color, (PAD, y + 3, 6, 12))
+            display.blit_left(label, display.font_xs, C['dim'], PAD + 14, y)
+
+            val = display.truncate(str(value), display.font_xs, W - PAD - 170)
+            vw = display.font_xs.size(val)[0]
+            display.blit_right(val, display.font_xs, color, W - PAD, y)
+
+            # Row-specific accents for extra color / structure.
+            if label == 'SIGNAL':
+                draw_signal_bars(W - PAD - vw - 8 - 4 * 8, y + 15, net.signal,
+                                 color=color)
+            elif label == 'SECURITY' and net.protected:
+                draw_lock(W - PAD - vw - 22, y, color=color)
+            y += 24
 
         if self.status:
             display.blit_center(self.status, display.font_xs,
@@ -322,6 +342,27 @@ class SettingsPanel:
         back.draw()
         btns += [act, back]
         self._buttons = btns
+
+    @staticmethod
+    def _detail_color(label, value, net):
+        """Color a detail value by meaning: green=good, yellow=warn, red=weak."""
+        if label == 'SIGNAL':
+            if net.signal >= 66:
+                return C['ok']
+            if net.signal >= 40:
+                return C['arrive']
+            return C['err']
+        if label == 'SECURITY':
+            return C['on'] if net.protected else C['arrive']  # open = caution
+        if label == 'PROTECTED':
+            return C['ok'] if value == 'Yes' else C['arrive']
+        if label == 'SAVED':
+            return C['arrive'] if value == 'Yes' else C['dim']
+        if label == 'STATUS':
+            return C['ok'] if str(value).startswith('Connected') else C['dim']
+        if label in ('IP', 'GATEWAY'):
+            return C['white']
+        return C['on']
 
     def _do_connect(self):
         net = self.selected
