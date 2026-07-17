@@ -11,6 +11,7 @@ the same API so the UI can be exercised with BART_DEV=1.
 
 import shutil
 import subprocess
+import sys
 import threading
 import time
 
@@ -104,33 +105,49 @@ def saved_ssids():
 def scan(rescan=True):
     """Return a de-duplicated list of Network, strongest signal per SSID."""
     if not _HAVE_NMCLI:
+        print('[wifi] nmcli not found on PATH — showing mock list', file=sys.stderr)
         return _mock_scan()
-    if rescan:
-        _run(['dev', 'wifi', 'rescan'], timeout=10)  # may rate-limit; ignore errors
-    rc, out, _ = _run(['-t', '-f', 'IN-USE,SIGNAL,SECURITY,SSID', 'dev', 'wifi', 'list'])
+
+    # `--rescan yes` forces a fresh scan and blocks until it finishes, unlike a
+    # separate `wifi rescan` (async) whose results aren't ready for `list` yet.
+    fields = ['-t', '-f', 'IN-USE,SIGNAL,SECURITY,SSID', 'device', 'wifi', 'list']
+    rc, out, err = _run(fields + ['--rescan', 'yes' if rescan else 'no'], timeout=25)
+    if rc != 0:
+        print(f'[wifi] list --rescan failed rc={rc}: {err.strip()}', file=sys.stderr)
+        # A forced rescan can be rejected if one ran seconds ago; fall back to
+        # the cached results rather than showing nothing.
+        rc, out, err = _run(fields + ['--rescan', 'no'], timeout=15)
+        if rc != 0:
+            print(f'[wifi] list failed rc={rc}: {err.strip()}', file=sys.stderr)
+
     saved = saved_ssids()
     by_ssid = {}
-    if rc == 0:
-        for line in out.splitlines():
-            parts = _split_terse(line)
-            if len(parts) < 4:
-                continue
-            in_use, signal, security, ssid = parts[0], parts[1], parts[2], parts[3]
-            if not ssid:
-                continue
-            try:
-                sig = int(signal)
-            except ValueError:
-                sig = 0
-            active = in_use.strip() == '*'
-            existing = by_ssid.get(ssid)
-            if existing is None or sig > existing.signal:
-                by_ssid[ssid] = Network(ssid, sig, security,
-                                        saved=ssid in saved, active=active)
-            if active and ssid in by_ssid:
-                by_ssid[ssid].active = True
+    for line in out.splitlines():
+        parts = _split_terse(line)
+        if len(parts) < 4:
+            continue
+        in_use, signal, security, ssid = parts[0], parts[1], parts[2], parts[3]
+        if not ssid:
+            continue
+        try:
+            sig = int(signal)
+        except ValueError:
+            sig = 0
+        active = in_use.strip() == '*'
+        existing = by_ssid.get(ssid)
+        if existing is None or sig > existing.signal:
+            by_ssid[ssid] = Network(ssid, sig, security,
+                                    saved=ssid in saved, active=active)
+        if active and ssid in by_ssid:
+            by_ssid[ssid].active = True
+
     nets = list(by_ssid.values())
     nets.sort(key=lambda n: (not n.active, -n.signal))
+    print(f'[wifi] scan found {len(nets)} network(s)', file=sys.stderr)
+    if not nets:
+        radio = _run(['-t', '-f', 'WIFI', 'radio'])[1].strip()
+        print(f'[wifi] radio={radio!r}; if "disabled" run: nmcli radio wifi on',
+              file=sys.stderr)
     return nets
 
 
