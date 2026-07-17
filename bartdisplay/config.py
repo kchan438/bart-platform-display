@@ -69,6 +69,13 @@ def get_touch_calibration():
     return _get('touch_calibration')
 
 
+def get_touch_tuning():
+    """Optional dict tuning tap/swipe sensitivity:
+    {tap_max_move, tap_max_time, flick_min_dist}. Larger tap_max_move = more
+    forgiving finger taps."""
+    return _get('touch_tuning')
+
+
 def _write_field(key, value):
     """Read-modify-write config.json so unrelated fields are never dropped."""
     with _lock:

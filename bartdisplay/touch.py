@@ -24,9 +24,10 @@ except Exception:  # evdev missing (e.g. desktop dev machine)
     _HAVE_EVDEV = False
 
 
-# Gesture thresholds (screen pixels / seconds).
-TAP_MAX_MOVE = 18      # max movement to still count as a tap
-TAP_MAX_TIME = 0.45    # max duration to still count as a tap
+# Gesture thresholds (screen pixels / seconds). Tuned for finger use on the
+# resistive panel; each is overridable per-device via config "touch_tuning".
+TAP_MAX_MOVE = 32      # max net down->up travel to still count as a tap
+TAP_MAX_TIME = 0.6     # max duration to still count as a tap
 FLICK_MIN_DIST = 55    # min vertical travel to count as a flick/swipe
 FLICK_MAX_TIME = 0.6   # max duration for a flick
 TOP_EDGE = 45          # a swipe-down starting above this y opens the shade
@@ -190,24 +191,31 @@ class GestureRecognizer:
     def __init__(self):
         self._down = None      # (x, y, t)
         self._last = None      # (x, y)
-        self._max_move = 0
+        self._settled = False  # have we seen a post-down sample yet?
+        tuning = config.get_touch_tuning() or {}
+        self.tap_max_move = tuning.get('tap_max_move', TAP_MAX_MOVE)
+        self.tap_max_time = tuning.get('tap_max_time', TAP_MAX_TIME)
+        self.flick_min_dist = tuning.get('flick_min_dist', FLICK_MIN_DIST)
 
     def feed(self, raw):
         if raw.kind == 'down':
             self._down = (raw.x, raw.y, raw.t)
             self._last = (raw.x, raw.y)
-            self._max_move = 0
+            self._settled = False
             return [{'kind': 'press', 'x': raw.x, 'y': raw.y}]
         if raw.kind == 'move':
             if self._down is None:
                 return []
+            if not self._settled:
+                # The resistive panel's touch-down coordinate is noisy; re-anchor
+                # to the first stable sample so taps aren't misread as drags.
+                self._down = (raw.x, raw.y, self._down[2])
+                self._last = (raw.x, raw.y)
+                self._settled = True
+                return [{'kind': 'drag', 'x': raw.x, 'y': raw.y, 'dx': 0, 'dy': 0}]
             lx, ly = self._last
             dx, dy = raw.x - lx, raw.y - ly
             self._last = (raw.x, raw.y)
-            self._max_move = max(
-                self._max_move,
-                abs(raw.x - self._down[0]) + abs(raw.y - self._down[1]),
-            )
             return [{'kind': 'drag', 'x': raw.x, 'y': raw.y, 'dx': dx, 'dy': dy}]
         if raw.kind == 'up':
             if self._down is None:
@@ -215,12 +223,16 @@ class GestureRecognizer:
             dx0, dy0, t0 = self._down
             total_dy = raw.y - dy0
             dur = raw.t - t0
-            tap = self._max_move <= TAP_MAX_MOVE and dur <= TAP_MAX_TIME
+            # Judge a tap by net down->up travel (not accumulated path), so
+            # jitter during the press still registers as a tap.
+            net = abs(raw.x - dx0) + abs(raw.y - dy0)
+            tap = net <= self.tap_max_move and dur <= self.tap_max_time
             swipe = None
-            if dur <= FLICK_MAX_TIME and abs(total_dy) >= FLICK_MIN_DIST \
+            if dur <= FLICK_MAX_TIME and abs(total_dy) >= self.flick_min_dist \
                     and abs(total_dy) > abs(raw.x - dx0):
                 swipe = 'down' if total_dy > 0 else 'up'
             self._down = None
+            self._settled = False
             return [{
                 'kind': 'release', 'x': raw.x, 'y': raw.y,
                 'start_y': dy0, 'total_dy': total_dy, 'dur': dur,
