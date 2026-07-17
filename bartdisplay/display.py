@@ -139,3 +139,20 @@ def truncate(text, font, max_px):
     while text and font.size(text + '...')[0] > max_px:
         text = text[:-1]
     return text + '...'
+
+
+def draw_cursor(x, y, active=True):
+    """Draw a crosshair + coordinate readout at a touch point (debug aid)."""
+    x, y = int(x), int(y)
+    col = C['arrive'] if active else C['on']
+    pygame.draw.line(screen, C['dim'], (0, y), (W, y), 1)
+    pygame.draw.line(screen, C['dim'], (x, 0), (x, H), 1)
+    pygame.draw.circle(screen, col, (x, y), 8, 2)
+    pygame.draw.circle(screen, col, (x, y), 1)
+    label = f'{x},{y}'
+    surf = font_xs.render(label, False, C['white'])
+    lx = x + 12 if x < W - surf.get_width() - 16 else x - 12 - surf.get_width()
+    ly = y + 12 if y < H - 24 else y - 12 - surf.get_height()
+    bg = pygame.Rect(lx - 2, ly - 1, surf.get_width() + 4, surf.get_height() + 2)
+    pygame.draw.rect(screen, C['bg'], bg)
+    screen.blit(surf, (lx, ly))

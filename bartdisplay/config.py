@@ -76,6 +76,12 @@ def get_touch_tuning():
     return _get('touch_tuning')
 
 
+def get_show_touch_cursor():
+    """Show a crosshair where the screen is being touched. Default on (debug aid)."""
+    v = _get('show_touch_cursor')
+    return True if v is None else bool(v)
+
+
 def _write_field(key, value):
     """Read-modify-write config.json so unrelated fields are never dropped."""
     with _lock:

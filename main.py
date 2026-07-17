@@ -5,9 +5,11 @@ the swipe-down settings panel. On the Pi, touch comes from the XPT2046 evdev
 device; with BART_DEV=1 the mouse stands in so the UI can be built on a desktop.
 """
 
+import sys
+
 import pygame
 
-from bartdisplay import board, config, departures, display, touch
+from bartdisplay import board, config, departures, display
 from bartdisplay.touch import RawEvent, GestureRecognizer, TouchReader, TOP_EDGE
 from bartdisplay.ui.settings import SettingsPanel
 
@@ -48,8 +50,17 @@ def main():
     blink_ms = 0
     running = True
 
+    show_cursor = config.get_show_touch_cursor()
+    cursor_pos = None
+    cursor_active = False
+    cursor_last = 0
+    CURSOR_LINGER = 2500  # keep the marker visible this long after release (ms)
+
     while running:
-        fps = FPS_ACTIVE if panel.is_active() else FPS_IDLE
+        now = pygame.time.get_ticks()
+        cursor_recent = cursor_pos is not None and (
+            cursor_active or now - cursor_last < CURSOR_LINGER)
+        fps = FPS_ACTIVE if (panel.is_active() or cursor_recent) else FPS_IDLE
         dt = clock.tick(fps)
 
         blink_ms += dt
@@ -70,6 +81,11 @@ def main():
             if raw == 'quit':
                 running = False
                 continue
+            cursor_pos = (raw.x, raw.y)
+            cursor_active = raw.kind != 'up'
+            cursor_last = pygame.time.get_ticks()
+            if raw.kind == 'down':
+                print(f'[touch] down at {raw.x},{raw.y}', file=sys.stderr)
             for sem in gestures.feed(raw):
                 if panel.is_active():
                     panel.handle(sem)
@@ -85,6 +101,8 @@ def main():
         rows, loading = departures.snapshot()
         board.render(rows, loading, blink)
         panel.render()
+        if show_cursor and cursor_recent:
+            display.draw_cursor(*cursor_pos, active=cursor_active)
         display.present()
 
     pygame.quit()
