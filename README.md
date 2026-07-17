@@ -17,12 +17,59 @@ SSH remains enabled so you can modify the project remotely at any time.
 
 ```
 bart-platform-display/
-├── main.py                         # pygame app
+├── main.py                         # entry point: render loop + input dispatch
+├── bartdisplay/                    # application package
+│   ├── config.py                   # config.json load/save (thread-safe)
+│   ├── display.py                  # pygame + framebuffer output, fonts, palette
+│   ├── departures.py               # BART ETD fetch (background thread)
+│   ├── board.py                    # main departure-board render
+│   ├── touch.py                    # XPT2046 evdev reader + gesture recognizer
+│   ├── wifi.py                     # nmcli wrapper (scan/connect/disconnect/info)
+│   └── ui/                         # swipe-down settings panel
+│       ├── widgets.py              # buttons + icon helpers
+│       ├── keyboard.py             # on-screen keyboard
+│       └── settings.py            # Wi-Fi + API-key panel
 ├── config.json                     # station, platform, API key
 ├── requirements.txt
 ├── fonts/
 │   └── PressStart2P-Regular.ttf    # must be downloaded (see below)
 └── bart-platform-display.service   # systemd unit for auto-start
+```
+
+## On-device settings panel
+
+The device is configured entirely from the touchscreen — no SSH needed:
+
+- **Swipe down** from the top edge to open the settings shade; **swipe up** to
+  return to the departure board.
+- **Wi-Fi**: scan and list networks with signal strength, encryption, a *SAVED*
+  tag for known networks, and the connected network marked *ONLINE*. Tap a
+  network to Connect / Disconnect or view its info. Password-protected networks
+  prompt for a password via the on-screen keyboard (with a **Hide** button).
+  Live status ("Connecting…", "Wrong password", "Connected") is shown while
+  joining. Networks are saved by NetworkManager and auto-reconnect on boot.
+- **BART API Key**: shows the current key; **Modify** edits it with the keyboard
+  and **Save** writes it to `config.json`. A new key applies on the next poll
+  (~30 s) without a restart; a **Restart App** button is offered to apply it
+  immediately.
+
+### Wi-Fi permissions (NetworkManager)
+
+Wi-Fi control uses `nmcli`. The app runs as the `kevinchan` user, so that user
+must be allowed to control NetworkManager without `sudo`. On Raspberry Pi OS this
+normally works out of the box (the user is in the `netdev` group). If connecting
+fails with "Not authorized", add a polkit rule:
+
+```bash
+sudo tee /etc/polkit-1/rules.d/50-nmcli.rules >/dev/null <<'EOF'
+polkit.addRule(function(action, subject) {
+  if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0 &&
+      subject.isInGroup("netdev")) {
+    return polkit.Result.YES;
+  }
+});
+EOF
+sudo systemctl restart polkit
 ```
 
 ---
@@ -145,6 +192,17 @@ python main.py
 ```
 
 The TFT should show the departure board. Press `Ctrl+C` to exit.
+
+### Develop on a desktop (no Pi)
+
+Set `BART_DEV=1` to run in a normal window instead of the framebuffer, with the
+mouse standing in for touch (click = tap, click-drag = swipe/scroll). Wi-Fi and
+touch hardware are mocked, so the settings panel UI can be built and tested off
+the Pi:
+
+```bash
+BART_DEV=1 python main.py
+```
 
 ---
 
