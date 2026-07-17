@@ -14,18 +14,20 @@ class Button:
     """A tappable rectangle with a centered label.
 
     `on_tap(button)` is called when a tap-release lands inside the button.
-    Track presses with set_pressed() so the button can render a highlight.
+    Pass border=None for a border-less button (the default is a dim border).
     """
 
+    _DEFAULT_BORDER = object()
+
     def __init__(self, rect, label, on_tap=None, font=None,
-                 fg=None, bg=None, border=None, enabled=True):
+                 fg=None, bg=None, border=_DEFAULT_BORDER, enabled=True):
         self.rect = pygame.Rect(rect)
         self.label = label
         self.on_tap = on_tap
         self.font = font
         self.fg = fg or C['on']
         self.bg = bg or C['panel_hi']
-        self.border = border if border is not None else C['dim']
+        self.border = C['dim'] if border is Button._DEFAULT_BORDER else border
         self.enabled = enabled
         self.pressed = False
 

@@ -134,9 +134,9 @@ def scan(rescan=True):
     return nets
 
 
-def info(net):
-    """Return a list of (label, value) rows describing a network."""
-    rows = [
+def info_basic(net):
+    """Static (label, value) rows describing a network — no subprocess calls."""
+    return [
         ('SSID', net.ssid),
         ('SIGNAL', f'{net.signal}%'),
         ('SECURITY', net.security or 'Open'),
@@ -144,6 +144,14 @@ def info(net):
         ('SAVED', 'Yes' if net.saved else 'No'),
         ('STATUS', 'Connected' if net.active else 'Not connected'),
     ]
+
+
+def info(net):
+    """Full info rows, including IP/gateway for the active network (spawns nmcli).
+
+    Call off the render thread — see info_basic() for the cheap subset.
+    """
+    rows = info_basic(net)
     if net.active and _HAVE_NMCLI:
         iface = wifi_iface()
         rc, out, _ = _run(['-t', '-f', 'IP4.ADDRESS,IP4.GATEWAY', 'device', 'show', iface])

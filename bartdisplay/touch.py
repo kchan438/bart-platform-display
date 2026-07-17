@@ -143,7 +143,8 @@ class TouchReader:
         mapper = self._make_mapper(dev)
         rx = ry = 0
         have_x = have_y = False
-        touching = False
+        touching = False       # finger is down
+        down_sent = False      # a 'down' has been emitted for this touch
         try:
             for ev in dev.read_loop():
                 if ev.type == ecodes.EV_ABS:
@@ -153,17 +154,21 @@ class TouchReader:
                         ry, have_y = ev.value, True
                 elif ev.type == ecodes.EV_KEY and ev.code == ecodes.BTN_TOUCH:
                     if ev.value == 1:
-                        touching = True
-                        if have_x and have_y:
-                            x, y = mapper(rx, ry)
-                            self._q.put(RawEvent('down', x, y))
+                        touching = True  # 'down' is emitted on the next SYN,
+                        # once coordinates are known (they may arrive after this)
                     else:
+                        if down_sent:
+                            x, y = mapper(rx, ry)
+                            self._q.put(RawEvent('up', x, y))
                         touching = False
-                        x, y = mapper(rx, ry)
-                        self._q.put(RawEvent('up', x, y))
+                        down_sent = False
                 elif ev.type == ecodes.EV_SYN and touching and have_x and have_y:
                     x, y = mapper(rx, ry)
-                    self._q.put(RawEvent('move', x, y))
+                    if not down_sent:
+                        self._q.put(RawEvent('down', x, y))
+                        down_sent = True
+                    else:
+                        self._q.put(RawEvent('move', x, y))
         except Exception as e:
             print(f'[touch] reader stopped: {e}', file=sys.stderr)
 

@@ -37,6 +37,7 @@ class SettingsPanel:
         self.networks = []
         self.scanning = False
         self.selected = None           # Network in detail view
+        self.detail_info = []          # cached info rows for the detail view
         self.connect_job = None
         self.status = ''
         self.scroll = 0
@@ -264,20 +265,36 @@ class SettingsPanel:
         name = display.truncate(net.ssid, display.font_xs, right - PAD - 6)
         display.blit_left(name, display.font_xs, name_color, PAD, y + (_ROW_H - 14) // 2)
 
-        return Button(row, '', on_tap=lambda _b, n=net: self._select(n),
+        # Clamp the tap target to the visible list band so a row scrolled under
+        # the header/footer can't be tapped there.
+        top = max(y, _LIST_TOP)
+        bottom = min(y + _ROW_H, _LIST_BOTTOM)
+        hit = pygame.Rect(0, top, W, max(0, bottom - top))
+        return Button(hit, '', on_tap=lambda _b, n=net: self._select(n),
                       bg=C['panel'], border=None)
 
     def _select(self, net):
         self.selected = net
         self.status = ''
         self.view = 'wifi_detail'
+        # Show the cheap rows immediately; fetch IP/gateway (nmcli) off-thread
+        # so the detail render never spawns subprocesses per frame.
+        self.detail_info = wifi.info_basic(net)
+        if net.active:
+            def work():
+                if self.selected is net:
+                    self.detail_info = wifi.info(net)
+            threading.Thread(target=work, daemon=True).start()
 
     # -- Wi-Fi detail -------------------------------------------------------
     def _render_wifi_detail(self):
         net = self.selected
+        if net is None:
+            self._buttons = self._header('NETWORK', back_to='wifi')
+            return
         btns = self._header('NETWORK', back_to='wifi')
         y = _HEADER_H + 8
-        for label, value in wifi.info(net):
+        for label, value in self.detail_info:
             display.blit_left(label, display.font_xs, C['dim'], PAD, y)
             val = display.truncate(str(value), display.font_xs, W - PAD - 130)
             display.blit_right(val, display.font_xs, C['white'], W - PAD, y)
@@ -319,9 +336,18 @@ class SettingsPanel:
         self.connect_job = wifi.connect_async(self.selected, password=password)
 
     def _do_disconnect(self):
-        ok, msg = wifi.disconnect(self.selected)
-        self.status = msg
-        self._start_scan()
+        # Run the blocking nmcli call off the render thread, then return to the
+        # list (a rescan reflects the new state).
+        net = self.selected
+
+        def work():
+            wifi.disconnect(net)
+            self._start_scan()
+        threading.Thread(target=work, daemon=True).start()
+        self.selected = None
+        self.status = ''
+        self.scroll = 0
+        self.view = 'wifi'
 
     # -- API key ------------------------------------------------------------
     def _render_apikey(self):
