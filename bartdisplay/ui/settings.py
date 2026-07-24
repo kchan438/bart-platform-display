@@ -35,11 +35,13 @@ class SettingsPanel:
         self.request_exit = False      # main loop watches this for RESTART
 
         self.networks = []
-        self.scanning = False
         self.selected = None           # Network in detail view
         self.detail_info = []          # cached info rows for the detail view
-        self.connect_job = None
+        self.scan_job = None
+        self.action_job = None
         self.status = ''
+        self.status_kind = 'info'       # info | success | error
+        self._after_scan_message = ''
         self.scroll = 0
 
         self.api_saved = False
@@ -64,25 +66,85 @@ class SettingsPanel:
     def _goto(self, view):
         self.view = view
         self.status = ''
+        self.status_kind = 'info'
         self.scroll = 0
         if view == 'wifi':
             self._start_scan()
         if view == 'apikey':
             self.api_saved = False
 
-    # -- Wi-Fi scanning (threaded so nmcli doesn't stall the render loop) ----
-    def _start_scan(self):
-        if self.scanning:
-            return
-        self.scanning = True
-        self.status = 'Scanning...'
+    # -- Wi-Fi operations ---------------------------------------------------
+    def _wifi_busy(self):
+        return (
+            (self.scan_job is not None and not self.scan_job.done)
+            or (self.action_job is not None and not self.action_job.done)
+        )
 
-        def work():
-            nets = wifi.scan(rescan=True)
-            self.networks = nets
-            self.scanning = False
-            self.status = ''
-        threading.Thread(target=work, daemon=True).start()
+    def _start_scan(self, after_message=''):
+        if self._wifi_busy():
+            return
+        self.scan_job = wifi.scan_async(rescan=True)
+        self._after_scan_message = after_message
+        self.status = 'Scanning...'
+        self.status_kind = 'info'
+
+    def _update_wifi_jobs(self):
+        if self.scan_job is not None:
+            job = self.scan_job
+            self.status = job.status
+            self.status_kind = 'info'
+            if job.done:
+                self.scan_job = None
+                if job.networks or job.ok:
+                    self.networks = job.networks
+                after_message = self._after_scan_message
+                self._after_scan_message = ''
+                if not job.ok:
+                    self.status = job.message
+                    self.status_kind = 'error'
+                elif after_message:
+                    self.status = (
+                        f'{after_message} - {job.message}'
+                        if job.message
+                        else after_message
+                    )
+                    self.status_kind = 'info' if job.partial else 'success'
+                elif job.message:
+                    self.status = job.message
+                    self.status_kind = 'info'
+                else:
+                    self.status = ''
+
+        if self.action_job is not None:
+            job = self.action_job
+            self.status = job.status
+            self.status_kind = 'info'
+            if not job.done:
+                return
+
+            self.action_job = None
+            if job.ok:
+                self.selected = None
+                self.detail_info = []
+                self.scroll = 0
+                self.view = 'wifi'
+                self._start_scan(after_message=job.message)
+                return
+
+            self.status = job.message
+            self.status_kind = 'error'
+            if job.needs_password and self.selected is not None:
+                title = (
+                    'Wrong password'
+                    if job.code == 'authentication_failed'
+                    else 'Password: ' + self.selected.ssid
+                )
+                self._open_keyboard(
+                    title,
+                    '',
+                    password=True,
+                    on_submit=self._connect_with_password,
+                )
 
     # -- per-frame update ---------------------------------------------------
     def update(self, dt_ms):
@@ -99,14 +161,7 @@ class SettingsPanel:
                 self.y_off = -H
                 self.state = 'CLOSED'
 
-        if self.connect_job is not None:
-            self.status = self.connect_job.status
-            if self.connect_job.done:
-                if self.connect_job.ok:
-                    self._start_scan()          # refresh saved/active flags
-                    self.selected = None
-                    self.view = 'wifi'
-                self.connect_job = None
+        self._update_wifi_jobs()
 
     def animating(self):
         return self.state in ('OPENING', 'CLOSING')
@@ -171,7 +226,8 @@ class SettingsPanel:
         btns = []
         if back_to is not None:
             b = Button((PAD, 5, 82, 26), 'BACK',
-                       on_tap=lambda _b: self._goto(back_to), font=display.font_xs)
+                       on_tap=lambda _b: self._goto(back_to), font=display.font_xs,
+                       enabled=not (back_to == 'wifi' and self._wifi_busy()))
             b.draw()
             btns.append(b)
         display.divider(_HEADER_H, color=C['dim'])
@@ -219,12 +275,18 @@ class SettingsPanel:
     def _render_wifi(self):
         btns = self._header('WI-FI', back_to='menu')
         rescan = Button((W - PAD - 116, 5, 116, 26), 'RESCAN',
-                        on_tap=lambda _b: self._start_scan(), font=display.font_xs)
+                        on_tap=lambda _b: self._start_scan(), font=display.font_xs,
+                        enabled=not self._wifi_busy())
         rescan.draw()
         btns.append(rescan)
 
         if self.status:
-            display.blit_center(self.status, display.font_xs, C['dim'], W // 2, 44)
+            status = display.truncate(self.status, display.font_xs, W - 2 * PAD)
+            status_color = {
+                'success': C['ok'],
+                'error': C['err'],
+            }.get(self.status_kind, C['dim'])
+            display.blit_center(status, display.font_xs, status_color, W // 2, 44)
 
         clip = pygame.Rect(0, _LIST_TOP, W, _LIST_BOTTOM - _LIST_TOP)
         self._surf.set_clip(clip)
@@ -236,7 +298,7 @@ class SettingsPanel:
             y += _ROW_H
         self._surf.set_clip(None)
 
-        if not self.networks and not self.scanning:
+        if not self.networks and self.scan_job is None:
             display.blit_center('No networks found', display.font_xs, C['ghost'], W // 2, 120)
         self._buttons = btns
 
@@ -271,7 +333,7 @@ class SettingsPanel:
         bottom = min(y + _ROW_H, _LIST_BOTTOM)
         hit = pygame.Rect(0, top, W, max(0, bottom - top))
         return Button(hit, '', on_tap=lambda _b, n=net: self._select(n),
-                      bg=C['panel'], border=None)
+                      bg=C['panel'], border=None, enabled=not self._wifi_busy())
 
     def _select(self, net):
         self.selected = net
@@ -321,23 +383,36 @@ class SettingsPanel:
             y += 24
 
         if self.status:
-            display.blit_center(self.status, display.font_xs,
-                                C['ok'] if self.status == 'Connected' else C['arrive'],
-                                W // 2, H - 62)
+            status = display.truncate(self.status, display.font_xs, W - 2 * PAD)
+            status_color = {
+                'success': C['ok'],
+                'error': C['err'],
+            }.get(self.status_kind, C['arrive'])
+            display.blit_center(status, display.font_xs, status_color, W // 2, H - 62)
 
         bw = (W - 2 * PAD - 10) // 2
         by = H - 40
-        connecting = self.connect_job is not None and not self.connect_job.done
+        busy = self._wifi_busy()
+        action_kind = self.action_job.kind if self.action_job is not None else ''
         if net.active:
-            act = Button((PAD, by, bw, 30), 'DISCONNECT',
-                         on_tap=lambda _b: self._do_disconnect(), font=display.font_xs)
+            label = 'DISCONNECTING...' if action_kind == 'disconnect' else 'DISCONNECT'
+            act = Button((PAD, by, bw, 30), label,
+                         on_tap=lambda _b: self._do_disconnect(), font=display.font_xs,
+                         enabled=not busy)
         else:
+            if not net.supported:
+                label = 'UNSUPPORTED'
+            elif action_kind == 'connect':
+                label = 'CONNECTING...'
+            else:
+                label = 'CONNECT'
             act = Button((PAD, by, bw, 30),
-                         'CONNECTING...' if connecting else 'CONNECT',
+                         label,
                          on_tap=lambda _b: self._do_connect(), font=display.font_xs,
-                         enabled=not connecting)
+                         enabled=not busy and net.supported)
         back = Button((PAD + bw + 10, by, bw, 30), 'BACK',
-                      on_tap=lambda _b: self._goto('wifi'), font=display.font_xs)
+                      on_tap=lambda _b: self._goto('wifi'), font=display.font_xs,
+                      enabled=not busy)
         act.draw()
         back.draw()
         btns += [act, back]
@@ -360,35 +435,51 @@ class SettingsPanel:
             return C['arrive'] if value == 'Yes' else C['dim']
         if label == 'STATUS':
             return C['ok'] if str(value).startswith('Connected') else C['dim']
+        if label == 'SUPPORT':
+            return C['err']
         if label in ('IP', 'GATEWAY'):
             return C['white']
         return C['on']
 
     def _do_connect(self):
+        if self._wifi_busy():
+            return
         net = self.selected
+        if net is None:
+            return
+        if not net.supported:
+            self.status = 'Unsupported network security'
+            self.status_kind = 'error'
+            return
         if net.protected and not net.saved:
             self._open_keyboard('Password: ' + net.ssid, '', password=True,
                                 on_submit=self._connect_with_password)
         else:
-            self.connect_job = wifi.connect_async(net)
+            self.action_job = wifi.connect_async(net)
+            self.status = 'Connecting...'
+            self.status_kind = 'info'
 
     def _connect_with_password(self, password):
         self.keyboard = None
-        self.connect_job = wifi.connect_async(self.selected, password=password)
+        if self.selected is None:
+            return
+        if not password:
+            self.status = 'Password required'
+            self.status_kind = 'error'
+            return
+        self.action_job = wifi.connect_async(self.selected, password=password)
+        self.status = 'Authenticating...'
+        self.status_kind = 'info'
 
     def _do_disconnect(self):
-        # Run the blocking nmcli call off the render thread, then return to the
-        # list (a rescan reflects the new state).
+        if self._wifi_busy():
+            return
         net = self.selected
-
-        def work():
-            wifi.disconnect(net)
-            self._start_scan()
-        threading.Thread(target=work, daemon=True).start()
-        self.selected = None
-        self.status = ''
-        self.scroll = 0
-        self.view = 'wifi'
+        if net is None:
+            return
+        self.action_job = wifi.disconnect_async(net)
+        self.status = 'Disconnecting...'
+        self.status_kind = 'info'
 
     # -- API key ------------------------------------------------------------
     def _render_apikey(self):

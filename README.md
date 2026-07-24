@@ -29,6 +29,10 @@ bart-platform-display/
 │       ├── widgets.py              # buttons + icon helpers
 │       ├── keyboard.py             # on-screen keyboard
 │       └── settings.py            # Wi-Fi + API-key panel
+├── deploy/
+│   └── polkit/                    # minimal NetworkManager authorization
+├── docs/product/                  # implementation-ready product requirements
+├── tests/                         # Wi-Fi lifecycle regression tests
 ├── config.json                     # station, platform, API key
 ├── requirements.txt
 ├── fonts/
@@ -46,8 +50,9 @@ The device is configured entirely from the touchscreen — no SSH needed:
   tag for known networks, and the connected network marked *ONLINE*. Tap a
   network to Connect / Disconnect or view its info. Password-protected networks
   prompt for a password via the on-screen keyboard (with a **Hide** button).
-  Live status ("Connecting…", "Wrong password", "Connected") is shown while
-  joining. Networks are saved by NetworkManager and auto-reconnect on boot.
+  Live connection, authentication, IP-assignment, and disconnect status is
+  shown. Recent results remain visible when a scan temporarily fails. Networks
+  are saved by NetworkManager and auto-reconnect on boot.
 - **BART API Key**: shows the current key; **Modify** edits it with the keyboard
   and **Save** writes it to `config.json`. A new key applies on the next poll
   (~30 s) without a restart; a **Restart App** button is offered to apply it
@@ -55,20 +60,27 @@ The device is configured entirely from the touchscreen — no SSH needed:
 
 ### Wi-Fi permissions (NetworkManager)
 
-Wi-Fi control uses `nmcli`. The app runs as the `kevinchan` user, so that user
-must be allowed to control NetworkManager without `sudo`. On Raspberry Pi OS this
-normally works out of the box (the user is in the `netdev` group). If connecting
-fails with "Not authorized", add a polkit rule:
+Wi-Fi control uses `nmcli`. The app runs as the `kevinchan` user in a headless
+systemd service, so PolicyKit cannot show an interactive authentication prompt.
+Install the repository's narrowly scoped rule:
 
 ```bash
-sudo tee /etc/polkit-1/rules.d/50-nmcli.rules >/dev/null <<'EOF'
-polkit.addRule(function(action, subject) {
-  if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0 &&
-      subject.isInGroup("netdev")) {
-    return polkit.Result.YES;
-  }
-});
-EOF
+sudo install -o root -g root -m 0644 \
+  deploy/polkit/50-bart-platform-display-networkmanager.rules \
+  /etc/polkit-1/rules.d/
+sudo systemctl restart polkit
+nmcli general permissions
+```
+
+The rule grants only Wi-Fi scanning, network control, and modification of
+NetworkManager connection profiles to `kevinchan`. The relevant permissions
+should report `yes`. The app remains non-root and does not receive permission to
+toggle the Wi-Fi radio or change unrelated NetworkManager settings.
+
+To roll the permission change back:
+
+```bash
+sudo rm /etc/polkit-1/rules.d/50-bart-platform-display-networkmanager.rules
 sudo systemctl restart polkit
 ```
 

@@ -20,9 +20,9 @@ _LETTER_ROWS = [
 ]
 _SYMBOL_ROWS = [
     list('1234567890'),
-    list('-/:;()$&@'),
-    list('.,?!\'"*+='),
-    ['SHIFT'] + list('_#%~<>|\\') + ['BKSP'],
+    list('-/:;()$&@['),
+    list('.,?!\'"*+=]'),
+    list('_#%~<>|\\{}^`') + ['BKSP'],
     ['ABC', 'SPACE', 'HIDE', 'DONE'],
 ]
 
