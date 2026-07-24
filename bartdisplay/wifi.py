@@ -16,6 +16,8 @@ import threading
 import time
 
 _HAVE_NMCLI = shutil.which('nmcli') is not None
+_WIFI_LIST_FIELDS = ['-t', '-f', 'IN-USE,SIGNAL,SECURITY,SSID',
+                     'device', 'wifi', 'list']
 
 
 class Network:
@@ -81,6 +83,27 @@ def _run(args, timeout=20):
         return 1, '', str(e)
 
 
+def _wifi_radio():
+    rc, out, err = _run(['-t', '-f', 'WIFI', 'radio'], timeout=10)
+    if rc != 0:
+        print(f'[wifi] radio check failed rc={rc}: {err.strip()}',
+              file=sys.stderr)
+        return ''
+    return out.strip().lower()
+
+
+def _ensure_wifi_radio_on():
+    radio = _wifi_radio()
+    if radio == 'disabled':
+        rc, _, err = _run(['radio', 'wifi', 'on'], timeout=10)
+        if rc != 0:
+            print(f'[wifi] radio enable failed rc={rc}: {err.strip()}',
+                  file=sys.stderr)
+        else:
+            # NetworkManager can need a moment before scans return AP rows.
+            time.sleep(1.0)
+
+
 def wifi_iface():
     rc, out, _ = _run(['-t', '-f', 'DEVICE,TYPE', 'device'])
     if rc == 0:
@@ -102,31 +125,30 @@ def saved_ssids():
     return names
 
 
-def scan(rescan=True):
-    """Return a de-duplicated list of Network, strongest signal per SSID."""
-    if not _HAVE_NMCLI:
-        print('[wifi] nmcli not found on PATH — showing mock list', file=sys.stderr)
-        return _mock_scan()
+def _wifi_list_args(rescan=None, iface=None):
+    args = list(_WIFI_LIST_FIELDS)
+    if iface:
+        args += ['ifname', iface]
+    if rescan is not None:
+        args += ['--rescan', 'yes' if rescan else 'no']
+    return args
 
-    # `--rescan yes` forces a fresh scan and blocks until it finishes, unlike a
-    # separate `wifi rescan` (async) whose results aren't ready for `list` yet.
-    fields = ['-t', '-f', 'IN-USE,SIGNAL,SECURITY,SSID', 'device', 'wifi', 'list']
-    rc, out, err = _run(fields + ['--rescan', 'yes' if rescan else 'no'], timeout=25)
-    if rc != 0:
-        print(f'[wifi] list --rescan failed rc={rc}: {err.strip()}', file=sys.stderr)
-        # A forced rescan can be rejected if one ran seconds ago; fall back to
-        # the cached results rather than showing nothing.
-        rc, out, err = _run(fields + ['--rescan', 'no'], timeout=15)
-        if rc != 0:
-            print(f'[wifi] list failed rc={rc}: {err.strip()}', file=sys.stderr)
 
-    saved = saved_ssids()
+def _scan_label(rescan, iface):
+    target = f'ifname={iface}' if iface else 'all-ifaces'
+    if rescan is None:
+        return target
+    return f'{target}, rescan={"yes" if rescan else "no"}'
+
+
+def _parse_scan_output(out, saved):
     by_ssid = {}
     for line in out.splitlines():
         parts = _split_terse(line)
         if len(parts) < 4:
             continue
-        in_use, signal, security, ssid = parts[0], parts[1], parts[2], parts[3]
+        in_use, signal, security = parts[0], parts[1], parts[2]
+        ssid = ':'.join(parts[3:])
         if not ssid:
             continue
         try:
@@ -136,19 +158,94 @@ def scan(rescan=True):
         active = in_use.strip() == '*'
         existing = by_ssid.get(ssid)
         if existing is None or sig > existing.signal:
+            was_active = existing.active if existing is not None else False
             by_ssid[ssid] = Network(ssid, sig, security,
-                                    saved=ssid in saved, active=active)
+                                    saved=ssid in saved,
+                                    active=active or was_active)
         if active and ssid in by_ssid:
             by_ssid[ssid].active = True
 
     nets = list(by_ssid.values())
     nets.sort(key=lambda n: (not n.active, -n.signal))
-    print(f'[wifi] scan found {len(nets)} network(s)', file=sys.stderr)
-    if not nets:
-        radio = _run(['-t', '-f', 'WIFI', 'radio'])[1].strip()
-        print(f'[wifi] radio={radio!r}; if "disabled" run: nmcli radio wifi on',
-              file=sys.stderr)
     return nets
+
+
+def _list_once(saved, iface, rescan):
+    rc, out, err = _run(_wifi_list_args(rescan=rescan, iface=iface),
+                       timeout=25 if rescan else 15)
+    label = _scan_label(rescan, iface)
+    if rc != 0:
+        print(f'[wifi] list ({label}) failed rc={rc}: {err.strip()}',
+              file=sys.stderr)
+        return []
+    nets = _parse_scan_output(out, saved)
+    if not nets:
+        print(f'[wifi] list ({label}) returned no networks', file=sys.stderr)
+    return nets
+
+
+def _list_with_targets(saved, iface, rescan):
+    seen = set()
+    for target in (None, iface):
+        if target in seen:
+            continue
+        seen.add(target)
+        nets = _list_once(saved, target, rescan)
+        if nets:
+            return nets
+    return []
+
+
+def _request_rescan(iface):
+    seen = set()
+    for target in (iface, None):
+        if target in seen:
+            continue
+        seen.add(target)
+        args = ['device', 'wifi', 'rescan']
+        if target:
+            args += ['ifname', target]
+        rc, _, err = _run(args, timeout=15)
+        if rc == 0:
+            time.sleep(2.0)
+            return True
+        print(f'[wifi] rescan request ({target or "all-ifaces"}) failed '
+              f'rc={rc}: {err.strip()}', file=sys.stderr)
+    return False
+
+
+def scan(rescan=True):
+    """Return a de-duplicated list of Network, strongest signal per SSID."""
+    if not _HAVE_NMCLI:
+        print('[wifi] nmcli not found on PATH - showing mock list',
+              file=sys.stderr)
+        return _mock_scan()
+
+    _ensure_wifi_radio_on()
+    iface = wifi_iface()
+    saved = saved_ssids()
+
+    if rescan:
+        nets = _list_with_targets(saved, iface, True)
+        if nets:
+            print(f'[wifi] scan found {len(nets)} network(s)', file=sys.stderr)
+            return nets
+
+        # Some Pi/NetworkManager combinations return an empty list from
+        # `list --rescan yes`; explicitly request a scan, then read cached rows.
+        _request_rescan(iface)
+
+    for mode in (False, None):
+        nets = _list_with_targets(saved, iface, mode)
+        if nets:
+            print(f'[wifi] scan found {len(nets)} network(s)', file=sys.stderr)
+            return nets
+
+    radio = _wifi_radio()
+    print('[wifi] scan found 0 network(s); '
+          f'radio={radio!r}; if disabled, run: nmcli radio wifi on',
+          file=sys.stderr)
+    return []
 
 
 def info_basic(net):
