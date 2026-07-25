@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid as uuidlib
 
 
 _HAVE_NMCLI = shutil.which('nmcli') is not None
@@ -37,9 +38,19 @@ _WIFI_LIST_FIELDS = [
 _SCAN_CACHE_TTL_SEC = 120.0
 _SCAN_COMPLETE_TIMEOUT_SEC = 12.0
 _CONNECT_VERIFY_TIMEOUT_SEC = 15.0
+_NMCLI_ACTIVATE_WAIT_SEC = 45
+_NMCLI_ACTIVATE_TIMEOUT_SEC = 55
+_NMCLI_PROFILE_WAIT_SEC = 10
+_NMCLI_PROFILE_TIMEOUT_SEC = 15
+_CANCEL_VERIFY_TIMEOUT_SEC = 4.0
 
 _operation_lock = threading.Lock()
 _scan_cache = {}
+_recovery_latch = None
+_autoconnect_restore = {}
+_reauth_required = set()
+
+_AUTOCONNECT_MARKER = 'org.bartdisplay.autoconnect-original'
 
 
 class SavedProfile:
@@ -57,13 +68,35 @@ class SavedProfile:
 class ActiveConnection:
     """The connection currently active on a Wi-Fi device."""
 
-    __slots__ = ('iface', 'state', 'name', 'uuid')
+    __slots__ = (
+        'iface',
+        'state',
+        'name',
+        'uuid',
+        'reason',
+        'query_ok',
+        'error_code',
+        'error_message',
+    )
 
-    def __init__(self, iface, state='', name='', uuid=''):
+    def __init__(
+            self,
+            iface,
+            state='',
+            name='',
+            uuid='',
+            reason='',
+            query_ok=True,
+            error_code='',
+            error_message=''):
         self.iface = iface
         self.state = state
         self.name = name
         self.uuid = uuid
+        self.reason = reason
+        self.query_ok = query_ok
+        self.error_code = error_code
+        self.error_message = error_message
 
 
 class Network:
@@ -80,6 +113,8 @@ class Network:
         'iface',
         'profile_name',
         'profile_uuid',
+        'profile_known',
+        'autoconnect',
         'stale',
         'last_seen',
     )
@@ -95,6 +130,8 @@ class Network:
             iface='',
             profile_name='',
             profile_uuid='',
+            profile_known=True,
+            autoconnect=None,
             stale=False,
             last_seen=0.0):
         self.ssid = ssid
@@ -107,6 +144,8 @@ class Network:
         self.iface = iface
         self.profile_name = profile_name
         self.profile_uuid = profile_uuid
+        self.profile_known = profile_known
+        self.autoconnect = autoconnect
         self.stale = stale
         self.last_seen = last_seen
 
@@ -134,6 +173,51 @@ class ScanResult:
         self.code = code
         self.message = message
         self.partial = partial
+
+
+class ProfileDiscoveryResult:
+    """Saved profiles plus whether NetworkManager returned a complete view."""
+
+    __slots__ = ('profiles', 'complete', 'code', 'message')
+
+    def __init__(
+            self,
+            profiles=None,
+            complete=True,
+            code='ok',
+            message=''):
+        self.profiles = profiles or {}
+        self.complete = complete
+        self.code = code
+        self.message = message
+
+
+class _RecoveryLatch:
+    """Unverified cleanup that must be reconciled before another operation."""
+
+    __slots__ = (
+        'iface',
+        'profile_uuid',
+        'delete_profile',
+        'network',
+        'reason',
+        'reauth_required',
+    )
+
+    def __init__(
+            self,
+            iface,
+            profile_uuid,
+            delete_profile=False,
+            network=None,
+            reason='',
+            reauth_required=False):
+        self.iface = iface
+        self.profile_uuid = profile_uuid
+        self.delete_profile = delete_profile
+        self.network = network
+        self.reason = reason
+        self.reauth_required = reauth_required
 
 
 class WifiJob:
@@ -229,12 +313,18 @@ def _split_terse(line):
 def _run_program(program, args, timeout=20, input_text=None):
     """Run a subprocess and return ``(returncode, stdout, stderr)``."""
     try:
+        env = os.environ.copy()
+        # Error classification depends on stable NetworkManager messages.
+        # Passwords are never placed in this environment.
+        env['LC_ALL'] = 'C'
+        env['LANG'] = 'C'
         process = subprocess.run(
             [program] + list(args),
             capture_output=True,
             text=True,
             input=input_text,
             timeout=timeout,
+            env=env,
         )
         return process.returncode, process.stdout, process.stderr
     except subprocess.TimeoutExpired:
@@ -252,11 +342,19 @@ def _error_text(out, err):
     return (err or out or '').strip()
 
 
+def _nmcli_timed_out(rc, out='', err=''):
+    """Return whether nmcli or the subprocess wrapper exhausted its wait."""
+    lower = _error_text(out, err).lower()
+    return (
+        rc in (3, 124)
+        or 'timed out' in lower
+        or 'timeout' in lower
+    )
+
+
 def _classify_error(rc, out, err, default='failed'):
     text = _error_text(out, err)
     lower = text.lower()
-    if rc == 124 or 'timed out' in lower or 'timeout' in lower:
-        return 'timeout', 'Timed out'
     if 'not authorized' in lower or 'permission' in lower:
         return 'not_authorized', 'Not authorized'
     if (
@@ -270,11 +368,21 @@ def _classify_error(rc, out, err, default='failed'):
         return 'network_not_found', 'Network not found'
     if 'dhcp' in lower or 'ip configuration' in lower:
         return 'dhcp_failed', 'Could not obtain IP'
+    if _nmcli_timed_out(rc, out, err):
+        return 'timeout', 'Timed out'
     if default == 'scan':
         return 'scan_failed', 'Scan failed'
     if default == 'disconnect':
         return 'disconnect_failed', 'Disconnect failed'
     return 'connect_failed', 'Failed to connect'
+
+
+def _state_query_error(rc, out, err):
+    """Classify a device-state read without calling it a connect failure."""
+    code, message = _classify_error(rc, out, err)
+    if code == 'connect_failed':
+        return 'state_query_failed', 'Could not read Wi-Fi state'
+    return code, message
 
 
 # ---------------------------------------------------------------------------
@@ -303,18 +411,26 @@ def wifi_iface():
     return 'wlan0'
 
 
-def _profile_ssid(uuid):
-    rc, out, _ = _run(
+def _profile_ssid_detailed(uuid):
+    rc, out, err = _run(
         ['-g', '802-11-wireless.ssid', 'connection', 'show', 'uuid', uuid],
         timeout=10,
     )
-    if rc != 0 or not out.strip():
-        return ''
-    return _split_terse(out.strip().splitlines()[0])[0]
+    if rc != 0:
+        return False, '', _error_text(out, err)
+    if not out.strip():
+        return False, '', 'Profile has no wireless SSID'
+    return True, _split_terse(out.strip().splitlines()[0])[0], ''
 
 
-def saved_profiles():
-    """Return Wi-Fi profiles keyed by their real SSID."""
+def _profile_ssid(uuid):
+    """Compatibility helper returning only the resolved SSID."""
+    _, ssid, _ = _profile_ssid_detailed(uuid)
+    return ssid
+
+
+def _saved_profiles_detailed():
+    """Return saved profiles and whether every profile query succeeded."""
     rc, out, err = _run(
         ['-t', '-f', 'NAME,UUID,TYPE,AUTOCONNECT', 'connection', 'show'],
         timeout=15,
@@ -324,22 +440,47 @@ def saved_profiles():
             f'[wifi] saved profile query failed rc={rc}: {_error_text(out, err)}',
             file=sys.stderr,
         )
-        return {}
+        code, message = _state_query_error(rc, out, err)
+        if code == 'state_query_failed':
+            code = 'profile_query_failed'
+            message = 'Saved network status unavailable'
+        return ProfileDiscoveryResult(
+            complete=False,
+            code=code,
+            message=message,
+        )
 
     profiles = {}
+    complete = True
     for line in out.splitlines():
         parts = _split_terse(line)
         if len(parts) < 3 or 'wireless' not in parts[2]:
             continue
         name, uuid = parts[0], parts[1]
-        ssid = _profile_ssid(uuid)
-        if not ssid:
+        ssid_ok, ssid, detail = _profile_ssid_detailed(uuid)
+        if not ssid_ok:
+            complete = False
+            print(
+                f'[wifi] saved profile SSID query failed for {uuid!r}: '
+                f'{detail or "unknown error"}',
+                file=sys.stderr,
+            )
             continue
         autoconnect = len(parts) < 4 or parts[3].lower() == 'yes'
         profiles.setdefault(ssid, []).append(
             SavedProfile(ssid, name, uuid, autoconnect=autoconnect)
         )
-    return profiles
+    return ProfileDiscoveryResult(
+        profiles,
+        complete=complete,
+        code='ok' if complete else 'profile_query_failed',
+        message='' if complete else 'Saved network status unavailable',
+    )
+
+
+def saved_profiles():
+    """Compatibility helper returning profiles keyed by their real SSID."""
+    return _saved_profiles_detailed().profiles
 
 
 def saved_ssids():
@@ -353,7 +494,7 @@ def active_connection(iface=None):
         [
             '-t',
             '-f',
-            'GENERAL.STATE,GENERAL.CONNECTION,GENERAL.CON-UUID',
+            'GENERAL.STATE,GENERAL.REASON,GENERAL.CONNECTION,GENERAL.CON-UUID',
             'device',
             'show',
             iface,
@@ -361,30 +502,64 @@ def active_connection(iface=None):
         timeout=10,
     )
     if rc != 0:
+        code, message = _state_query_error(rc, out, err)
         print(
             f'[wifi] active connection query failed rc={rc}: '
             f'{_error_text(out, err)}',
             file=sys.stderr,
         )
-        return ActiveConnection(iface)
+        return ActiveConnection(
+            iface,
+            query_ok=False,
+            error_code=code,
+            error_message=message,
+        )
 
     values = {}
     for line in out.splitlines():
         parts = _split_terse(line)
         if len(parts) >= 2:
             values[parts[0]] = ':'.join(parts[1:])
+    if 'GENERAL.STATE' not in values:
+        return ActiveConnection(
+            iface,
+            query_ok=False,
+            error_code='state_query_failed',
+            error_message='Could not read Wi-Fi state',
+        )
+
+    name = values.get('GENERAL.CONNECTION', '')
+    uuid = values.get('GENERAL.CON-UUID', '')
     return ActiveConnection(
         iface,
         state=values.get('GENERAL.STATE', ''),
-        name=values.get('GENERAL.CONNECTION', ''),
-        uuid=values.get('GENERAL.CON-UUID', ''),
+        name='' if name == '--' else name,
+        uuid='' if uuid == '--' else uuid,
+        reason=values.get('GENERAL.REASON', ''),
     )
 
 
-def _profile_for_ssid(profiles, ssid, active_uuid=''):
-    candidates = profiles.get(ssid, [])
+def _profile_for_ssid(
+        profiles,
+        ssid,
+        active_uuid='',
+        preferred_uuid=''):
+    candidates = sorted(
+        profiles.get(ssid, []),
+        key=lambda profile: (
+            not profile.autoconnect,
+            profile.name.casefold(),
+            profile.uuid,
+        ),
+    )
     for profile in candidates:
         if profile.uuid == active_uuid:
+            return profile
+    for profile in candidates:
+        if profile.uuid == preferred_uuid:
+            return profile
+    for profile in candidates:
+        if profile.autoconnect:
             return profile
     return candidates[0] if candidates else None
 
@@ -419,6 +594,8 @@ def _clone_network(net, **changes):
         'iface': net.iface,
         'profile_name': net.profile_name,
         'profile_uuid': net.profile_uuid,
+        'profile_known': net.profile_known,
+        'autoconnect': net.autoconnect,
         'stale': net.stale,
         'last_seen': net.last_seen,
     }
@@ -426,7 +603,12 @@ def _clone_network(net, **changes):
     return Network(**values)
 
 
-def _parse_scan_output(out, profiles=None, active=None, now=None):
+def _parse_scan_output(
+        out,
+        profiles=None,
+        active=None,
+        now=None,
+        profiles_complete=True):
     """Parse access points and de-duplicate them by SSID."""
     profiles = profiles or {}
     active = active or ActiveConnection('')
@@ -466,6 +648,8 @@ def _parse_scan_output(out, profiles=None, active=None, now=None):
             iface=iface,
             profile_name=profile.name if profile else '',
             profile_uuid=profile.uuid if profile else '',
+            profile_known=profile is not None or profiles_complete,
+            autoconnect=profile.autoconnect if profile else None,
             last_seen=now,
         )
 
@@ -492,6 +676,8 @@ def _parse_scan_output(out, profiles=None, active=None, now=None):
                 by_ssid[ssid].saved = True
                 by_ssid[ssid].profile_name = profile.name
                 by_ssid[ssid].profile_uuid = profile.uuid
+                by_ssid[ssid].profile_known = True
+                by_ssid[ssid].autoconnect = profile.autoconnect
             else:
                 by_ssid[ssid] = Network(
                     ssid,
@@ -500,6 +686,8 @@ def _parse_scan_output(out, profiles=None, active=None, now=None):
                     iface=active.iface,
                     profile_name=profile.name,
                     profile_uuid=profile.uuid,
+                    profile_known=True,
+                    autoconnect=profile.autoconnect,
                     last_seen=now,
                 )
             break
@@ -565,19 +753,45 @@ def _request_rescan_and_wait(iface):
     return False, 'scan_timeout', 'Scan timed out', 'LastScan did not advance'
 
 
-def _read_scan_rows(profiles, active, iface):
+def _read_scan_rows(profiles, active, iface, profiles_complete=True):
     rc, out, err = _run(_wifi_list_args(iface=iface), timeout=15)
     if rc != 0:
         code, message = _classify_error(rc, out, err, default='scan')
         return [], code, message, _error_text(out, err)
-    return _parse_scan_output(out, profiles, active), 'ok', '', ''
+    return (
+        _parse_scan_output(
+            out,
+            profiles,
+            active,
+            profiles_complete=profiles_complete,
+        ),
+        'ok',
+        '',
+        '',
+    )
 
 
-def _merge_scan_cache(fresh):
+def _merge_scan_cache(fresh, preserve_profile_identity=False):
     now = time.monotonic()
     fresh_by_ssid = {}
     for network in fresh:
         current = _clone_network(network, stale=False, last_seen=now)
+        cached = _scan_cache.get(current.ssid)
+        if (
+                preserve_profile_identity
+                and not current.profile_known
+                and cached is not None
+                and cached.profile_known):
+            current = _clone_network(
+                current,
+                saved=cached.saved,
+                profile_name=cached.profile_name,
+                profile_uuid=cached.profile_uuid,
+                # The identity is useful as a recent hint, but it is not
+                # authoritative until a complete profile query confirms it.
+                profile_known=False,
+                autoconnect=cached.autoconnect,
+            )
         fresh_by_ssid[current.ssid] = current
         _scan_cache[current.ssid] = _clone_network(current)
 
@@ -635,8 +849,17 @@ def _scan_detailed_unlocked(rescan=True):
         )
 
     iface = wifi_iface()
-    profiles = saved_profiles()
-    scan_error = None
+    profile_result = _saved_profiles_detailed()
+    profiles = profile_result.profiles
+    scan_error = (
+        None
+        if profile_result.complete
+        else (
+            profile_result.code,
+            profile_result.message,
+            profile_result.message,
+        )
+    )
 
     if rescan:
         completed, code, message, detail = _request_rescan_and_wait(iface)
@@ -652,6 +875,7 @@ def _scan_detailed_unlocked(rescan=True):
         profiles,
         active,
         iface,
+        profiles_complete=profile_result.complete,
     )
     if list_code != 'ok':
         scan_error = scan_error or (list_code, list_message, list_detail)
@@ -661,7 +885,10 @@ def _scan_detailed_unlocked(rescan=True):
             file=sys.stderr,
         )
 
-    networks, partial = _merge_scan_cache(fresh)
+    networks, partial = _merge_scan_cache(
+        fresh,
+        preserve_profile_identity=not profile_result.complete,
+    )
     print(
         f'[wifi] scan found {len(fresh)} fresh network(s), '
         f'{len(networks)} displayed',
@@ -705,6 +932,15 @@ def scan_detailed(rescan=True):
             partial=partial,
         )
     try:
+        if not _reconcile_recovery():
+            cached, partial = _recent_cached_networks()
+            return ScanResult(
+                cached,
+                ok=False,
+                code='cleanup_pending',
+                message='Previous connection cleanup is still pending',
+                partial=partial,
+            )
         return _scan_detailed_unlocked(rescan=rescan)
     finally:
         _operation_lock.release()
@@ -737,12 +973,17 @@ def scan_async(rescan=True):
 # ---------------------------------------------------------------------------
 
 def info_basic(net):
+    saved_value = (
+        'Yes'
+        if net.saved
+        else ('No' if net.profile_known else 'Unknown')
+    )
     rows = [
         ('SSID', net.ssid),
         ('SIGNAL', f'{net.signal}%'),
         ('SECURITY', net.security or 'Open'),
         ('PROTECTED', 'Yes' if net.protected else 'No'),
-        ('SAVED', 'Yes' if net.saved else 'No'),
+        ('SAVED', saved_value),
         ('STATUS', 'Connected' if net.active else 'Not connected'),
     ]
     if not net.supported:
@@ -775,6 +1016,47 @@ def info(net):
 # Connection and authentication
 # ---------------------------------------------------------------------------
 
+def _set_recovery_latch(
+        iface,
+        profile_uuid,
+        delete_profile=False,
+        network=None,
+        reason='',
+        reauth_required=False):
+    """Remember cleanup that was not safe to consider complete."""
+    global _recovery_latch
+    _recovery_latch = _RecoveryLatch(
+        iface,
+        profile_uuid,
+        delete_profile=delete_profile,
+        network=network,
+        reason=reason,
+        reauth_required=reauth_required,
+    )
+
+
+def _reconcile_recovery(job=None):
+    """Retry and verify pending cleanup before any later Wi-Fi operation."""
+    global _recovery_latch
+    latch = _recovery_latch
+    if latch is None:
+        return True
+
+    if job is not None:
+        job.set_status('Recovering Wi-Fi...')
+    if not _cancel_activation(latch.profile_uuid, latch.iface):
+        return False
+    if (
+            latch.delete_profile
+            and not _discard_new_profile(latch.network, latch.profile_uuid)):
+        return False
+
+    if latch.reauth_required and not latch.delete_profile:
+        _reauth_required.add(latch.profile_uuid)
+    _recovery_latch = None
+    return True
+
+
 def _launch_job(job, worker):
     def run():
         if not _operation_lock.acquire(blocking=False):
@@ -782,6 +1064,13 @@ def _launch_job(job, worker):
             return
         job._managed = True
         try:
+            if not _reconcile_recovery(job):
+                job.finish(
+                    False,
+                    'Previous connection cleanup is still pending',
+                    code='cleanup_pending',
+                )
+                return
             worker()
         except Exception as exc:
             print(f'[wifi] {job.kind} failed unexpectedly: {exc}', file=sys.stderr)
@@ -794,8 +1083,21 @@ def _launch_job(job, worker):
     threading.Thread(target=run, daemon=True).start()
 
 
-def _connection_up_with_password(uuid, iface, password):
-    """Activate a saved profile with a secret supplied outside argv."""
+def _activate_profile(profile_uuid, iface, password=None):
+    """Activate a UUID-addressed profile without interactive nmcli prompts."""
+    args = [
+        '--wait',
+        str(_NMCLI_ACTIVATE_WAIT_SEC),
+        'connection',
+        'up',
+        'uuid',
+        profile_uuid,
+        'ifname',
+        iface,
+    ]
+    if password is None:
+        return _run(args, timeout=_NMCLI_ACTIVATE_TIMEOUT_SEC)
+
     fd, path = tempfile.mkstemp(prefix='bart-wifi-', text=True)
     try:
         os.chmod(path, 0o600)
@@ -804,17 +1106,8 @@ def _connection_up_with_password(uuid, iface, password):
                 '802-11-wireless-security.psk:' + password + '\n'
             )
         return _run(
-            [
-                'connection',
-                'up',
-                'uuid',
-                uuid,
-                'ifname',
-                iface,
-                'passwd-file',
-                path,
-            ],
-            timeout=60,
+            args + ['passwd-file', path],
+            timeout=_NMCLI_ACTIVATE_TIMEOUT_SEC,
         )
     finally:
         try:
@@ -823,20 +1116,346 @@ def _connection_up_with_password(uuid, iface, password):
             pass
 
 
-def _connect_new(net, iface, password):
-    args = ['--ask', 'device', 'wifi', 'connect', net.ssid, 'ifname', iface]
-    # Do not pass ``bssid`` here: nmcli persists it on a newly-created profile,
-    # which would pin mesh networks to one access point and break roaming.
-    input_text = None
+def _wifi_key_mgmt(net):
+    """Return the least restrictive supported key management for a scan row."""
+    security = net.security.upper()
+    if 'WPA3' in security and 'WPA2' not in security:
+        return 'sae'
+    return 'wpa-psk'
+
+
+def _new_profile_name(net):
+    """Return a unique, human-readable profile name for one SSID."""
+    return f'{net.ssid} (BART {uuidlib.uuid4().hex[:8]})'
+
+
+def _create_profile(net, iface):
+    """Create a non-interactive profile and retain its NetworkManager UUID."""
+    profile_name = _new_profile_name(net)
+    profile_uuid = str(uuidlib.uuid4())
+    args = [
+        '--wait',
+        str(_NMCLI_PROFILE_WAIT_SEC),
+        'connection',
+        'add',
+        'type',
+        'wifi',
+        'con-name',
+        profile_name,
+        'ifname',
+        iface,
+        'ssid',
+        net.ssid,
+        'connection.uuid',
+        profile_uuid,
+        'connection.autoconnect',
+        'no',
+    ]
     if net.protected:
-        input_text = (password or '') + '\n'
-    return _run(args, timeout=60, input_text=input_text)
+        args += [
+            'wifi-sec.key-mgmt',
+            _wifi_key_mgmt(net),
+            # System-owned secrets returned by the authorized nmcli agent are
+            # persisted by NetworkManager for disconnect/reboot reconnects.
+            'wifi-sec.psk-flags',
+            '0',
+        ]
+
+    # Do not pass a BSSID: persisting it would pin mesh networks to one access
+    # point and break roaming. The password is supplied only during activation.
+    rc, out, err = _run(args, timeout=_NMCLI_PROFILE_TIMEOUT_SEC)
+    if rc != 0:
+        # A timed-out add can have reached NetworkManager even though nmcli did
+        # not observe the reply. Because the UUID is caller-assigned, the
+        # uncertain profile can still be located and removed without relying
+        # on a non-unique human-readable name.
+        exists = _profile_exists(profile_uuid)
+        if exists is True:
+            if not _discard_new_profile(None, profile_uuid):
+                _set_recovery_latch(
+                    iface,
+                    profile_uuid,
+                    delete_profile=True,
+                    reason='profile creation cleanup',
+                )
+        elif exists is None:
+            _set_recovery_latch(
+                iface,
+                profile_uuid,
+                delete_profile=True,
+                reason='ambiguous profile creation',
+            )
+        return rc, out, err, ''
+
+    # Keep the identity through activation so cleanup targets the exact profile.
+    # Failed first-time profiles are discarded before a later retry.
+    net.profile_name = profile_name
+    net.profile_uuid = profile_uuid
+    net.saved = True
+    net.profile_known = True
+    net.autoconnect = False
+    return 0, out, err, profile_uuid
+
+
+def _enable_profile_autoconnect(profile_uuid):
+    """Enable autoconnect only after a profile has connected successfully."""
+    return _run(
+        [
+            '--wait',
+            str(_NMCLI_PROFILE_WAIT_SEC),
+            'connection',
+            'modify',
+            'uuid',
+            profile_uuid,
+            'connection.autoconnect',
+            'yes',
+        ],
+        timeout=_NMCLI_PROFILE_TIMEOUT_SEC,
+    )
+
+
+def _profile_autoconnect(profile_uuid):
+    """Read a profile's current autoconnect preference."""
+    rc, out, err = _run(
+        [
+            '-g',
+            'connection.autoconnect',
+            'connection',
+            'show',
+            'uuid',
+            profile_uuid,
+        ],
+        timeout=_NMCLI_PROFILE_TIMEOUT_SEC,
+    )
+    if rc != 0:
+        return rc, out, err, None
+    value = next(
+        (line.strip().lower() for line in out.splitlines() if line.strip()),
+        '',
+    )
+    if value not in ('yes', 'no'):
+        return 1, out, 'Could not read profile autoconnect setting', None
+    return 0, out, err, value == 'yes'
+
+
+def _profile_autoconnect_marker(profile_uuid):
+    """Read the crash-safe original autoconnect value stored on the profile."""
+    rc, out, err = _run(
+        [
+            '-g',
+            'user.data',
+            'connection',
+            'show',
+            'uuid',
+            profile_uuid,
+        ],
+        timeout=_NMCLI_PROFILE_TIMEOUT_SEC,
+    )
+    if rc != 0:
+        return rc, out, err, None
+
+    # nmcli renders dictionary entries as key=value pairs. It may separate
+    # entries with commas or newlines depending on output mode/version.
+    for entry in out.replace('\n', ',').split(','):
+        key, separator, value = entry.partition('=')
+        if separator and key.strip() == _AUTOCONNECT_MARKER:
+            normalized = value.strip().lower()
+            if normalized in ('yes', 'no'):
+                return 0, out, err, normalized == 'yes'
+            return 1, out, 'Invalid saved autoconnect recovery value', None
+    return 0, out, err, None
+
+
+def _load_autoconnect_restore(profile_uuid):
+    """Load a pending original preference from NetworkManager after restart."""
+    if profile_uuid in _autoconnect_restore:
+        return 0, '', ''
+    rc, out, err, original = _profile_autoconnect_marker(profile_uuid)
+    if rc == 0 and original is not None:
+        _autoconnect_restore[profile_uuid] = original
+    return rc, out, err
+
+
+def _prepare_saved_psk(profile_uuid):
+    """Block autoconnect before accepting a replacement system-owned PSK."""
+    marker_rc, marker_out, marker_err, marker_original = (
+        _profile_autoconnect_marker(profile_uuid)
+    )
+    if marker_rc != 0:
+        return marker_rc, marker_out, marker_err, None
+
+    marker_exists = marker_original is not None
+    if marker_exists:
+        original_autoconnect = marker_original
+    elif profile_uuid in _autoconnect_restore:
+        original_autoconnect = _autoconnect_restore[profile_uuid]
+    else:
+        rc, out, err, current_autoconnect = _profile_autoconnect(profile_uuid)
+        if rc != 0:
+            return rc, out, err, None
+        original_autoconnect = current_autoconnect
+
+    args = [
+        '--wait',
+        str(_NMCLI_PROFILE_WAIT_SEC),
+        'connection',
+        'modify',
+        'uuid',
+        profile_uuid,
+        # One atomic profile update: modification unblocks a connection after
+        # `connection down`, so it must already be ineligible for autoconnect
+        # when the stale PSK is removed.
+        'connection.autoconnect',
+        'no',
+        'wifi-sec.psk-flags',
+        '0',
+        # passwd-file is a secret-agent source. Clearing the stored value makes
+        # NetworkManager request and persist the replacement typed by the user.
+        'wifi-sec.psk',
+        '',
+    ]
+    if not marker_exists:
+        args += [
+            '+user.data',
+            (
+                f'{_AUTOCONNECT_MARKER}='
+                f'{"yes" if original_autoconnect else "no"}'
+            ),
+        ]
+
+    rc, out, err = _run(args, timeout=_NMCLI_PROFILE_TIMEOUT_SEC)
+    if rc == 0:
+        _autoconnect_restore[profile_uuid] = original_autoconnect
+    return rc, out, err, original_autoconnect
+
+
+def _restore_saved_autoconnect(profile_uuid):
+    """Restore the preference captured before a replacement-password attempt."""
+    rc, out, err = _load_autoconnect_restore(profile_uuid)
+    if rc != 0:
+        return rc, out, err
+    if profile_uuid not in _autoconnect_restore:
+        return 0, '', ''
+
+    original = _autoconnect_restore[profile_uuid]
+    rc, out, err = _run(
+        [
+            '--wait',
+            str(_NMCLI_PROFILE_WAIT_SEC),
+            'connection',
+            'modify',
+            'uuid',
+            profile_uuid,
+            'connection.autoconnect',
+            'yes' if original else 'no',
+            '-user.data',
+            _AUTOCONNECT_MARKER,
+        ],
+        timeout=_NMCLI_PROFILE_TIMEOUT_SEC,
+    )
+    if rc == 0:
+        _autoconnect_restore.pop(profile_uuid, None)
+    return rc, out, err
+
+
+def _wait_activation_stopped(profile_uuid, iface):
+    """Confirm that a profile is no longer active or activating on a device."""
+    deadline = time.monotonic() + _CANCEL_VERIFY_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        current = active_connection(iface)
+        if current.query_ok and current.uuid != profile_uuid:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _cancel_activation(profile_uuid, iface):
+    """Stop and verify an activation that outlived a bounded wait."""
+    args = [
+        '--wait',
+        str(_NMCLI_PROFILE_WAIT_SEC),
+        'connection',
+        'down',
+        'uuid',
+        profile_uuid,
+    ]
+    for _ in range(2):
+        _run(args, timeout=_NMCLI_PROFILE_TIMEOUT_SEC)
+        if _wait_activation_stopped(profile_uuid, iface):
+            return True
+    return False
+
+
+def _profile_exists(profile_uuid):
+    """Return True/False for a verified profile lookup, or None on read error."""
+    rc, out, err = _run(
+        [
+            '-g',
+            'connection.uuid',
+            'connection',
+            'show',
+            'uuid',
+            profile_uuid,
+        ],
+        timeout=_NMCLI_PROFILE_TIMEOUT_SEC,
+    )
+    if rc == 0:
+        return bool(out.strip())
+    lower = _error_text(out, err).lower()
+    if (
+            rc == 10
+            or 'not found' in lower
+            or 'unknown connection' in lower
+            or 'does not exist' in lower):
+        return False
+    return None
+
+
+def _discard_new_profile(net, profile_uuid):
+    """Remove a profile that never reached a verified connection."""
+    rc, out, err = _run(
+        [
+            '--wait',
+            str(_NMCLI_PROFILE_WAIT_SEC),
+            'connection',
+            'delete',
+            'uuid',
+            profile_uuid,
+        ],
+        timeout=_NMCLI_PROFILE_TIMEOUT_SEC,
+    )
+    exists = _profile_exists(profile_uuid)
+    if exists is not False:
+        print(
+            f'[wifi] failed to remove unverified profile '
+            f'{profile_uuid!r}: '
+            f'{_error_text(out, err) or "deletion could not be verified"}',
+            file=sys.stderr,
+        )
+        return False
+
+    if net is not None and net.profile_uuid == profile_uuid:
+        net.profile_name = ''
+        net.profile_uuid = ''
+        net.saved = False
+        net.profile_known = True
+        net.autoconnect = None
+    _autoconnect_restore.pop(profile_uuid, None)
+    _reauth_required.discard(profile_uuid)
+    return True
 
 
 def _verify_connected(iface, expected_uuid='', expected_ssid=''):
     deadline = time.monotonic() + _CONNECT_VERIFY_TIMEOUT_SEC
+    last_state_error = ''
+    saw_valid_state = False
     while time.monotonic() < deadline:
         active = active_connection(iface)
+        if not active.query_ok:
+            last_state_error = active.error_message
+            time.sleep(0.5)
+            continue
+        saw_valid_state = True
         state_connected = active.state.startswith('100')
         uuid_matches = not expected_uuid or active.uuid == expected_uuid
         if state_connected and uuid_matches and active.uuid:
@@ -857,7 +1476,55 @@ def _verify_connected(iface, expected_uuid='', expected_ssid=''):
                 if address:
                     return True, active.uuid, ''
         time.sleep(0.5)
+    if not saw_valid_state and last_state_error:
+        return False, '', last_state_error
     return False, '', 'Connection activated without an IPv4 address'
+
+
+def _activation_timeout_stage(iface, expected_uuid='', protected=False):
+    """Best-effort classification of where a timed-out activation stalled."""
+    active = active_connection(iface)
+    if not active.query_ok:
+        return 'unknown'
+    if expected_uuid and active.uuid and active.uuid != expected_uuid:
+        return 'unknown'
+
+    reason = active.reason.lower()
+    try:
+        reason_code = int(reason.split()[0])
+    except (ValueError, IndexError):
+        reason_code = -1
+    if any(
+            token in reason
+            for token in (
+                'secret',
+                'password',
+                'authentication',
+                'no-secrets',
+            )) or reason_code in range(7, 12):
+        return 'authentication'
+    if any(
+            token in reason
+            for token in (
+                'dhcp',
+                'ip-config',
+                'ip config',
+                'ip configuration',
+                'lease',
+            )):
+        return 'ip'
+
+    try:
+        state = int(active.state.split()[0])
+    except (ValueError, IndexError):
+        return 'unknown'
+    if protected and state == 50:  # NM_DEVICE_STATE_CONFIG (Wi-Fi association)
+        return 'authentication'
+    if state == 60:  # NM_DEVICE_STATE_NEED_AUTH
+        return 'authentication'
+    if 70 <= state <= 100:  # IP_CONFIG through ACTIVATED
+        return 'ip'
+    return 'unknown'
 
 
 def connect_async(net, password=None):
@@ -872,7 +1539,60 @@ def _connect_worker(job, net, password):
     if not net.supported:
         job.finish(False, 'Unsupported network security', code='unsupported')
         return
-    if net.protected and not net.saved and not password:
+
+    iface = net.iface or wifi_iface()
+    preferred_uuid = net.profile_uuid
+    expected_uuid = ''
+    created_profile = False
+    prepared_saved_psk = False
+    original_autoconnect = None
+
+    # Re-resolve every selected identity immediately before activation. Cached
+    # scan data is a display hint, not proof that a UUID still exists or still
+    # belongs to this SSID.
+    job.set_status('Checking saved network...')
+    discovery = _saved_profiles_detailed()
+    if not discovery.complete:
+        net.profile_known = False
+        job.finish(
+            False,
+            discovery.message or 'Saved network status unavailable',
+            code=discovery.code or 'profile_query_failed',
+        )
+        return
+    active = active_connection(iface)
+    active_uuid = active.uuid if active.query_ok else ''
+    profile = _profile_for_ssid(
+        discovery.profiles,
+        net.ssid,
+        active_uuid=active_uuid,
+        preferred_uuid=preferred_uuid,
+    )
+    net.profile_known = True
+    if profile is not None:
+        net.saved = True
+        net.profile_name = profile.name
+        net.profile_uuid = profile.uuid
+        net.autoconnect = profile.autoconnect
+        expected_uuid = profile.uuid
+    else:
+        net.saved = False
+        net.profile_name = ''
+        net.profile_uuid = ''
+        net.autoconnect = None
+        if preferred_uuid:
+            _reauth_required.discard(preferred_uuid)
+
+    if expected_uuid in _reauth_required and password is None:
+        job.finish(
+            False,
+            'Password required after the previous timed-out attempt',
+            code='authentication_timeout',
+            needs_password=True,
+        )
+        return
+
+    if net.protected and not expected_uuid and not password:
         job.finish(
             False,
             'Password required',
@@ -881,68 +1601,256 @@ def _connect_worker(job, net, password):
         )
         return
 
-    iface = net.iface or wifi_iface()
     job.set_status('Authenticating...' if net.protected else 'Connecting...')
-
-    expected_uuid = net.profile_uuid
-    if net.saved and expected_uuid:
-        if password is not None:
-            rc, out, err = _connection_up_with_password(
-                expected_uuid,
-                iface,
-                password,
+    if not expected_uuid:
+        rc, out, err, expected_uuid = _create_profile(net, iface)
+        if rc != 0:
+            code, message = _classify_error(rc, out, err)
+            print(
+                f'[wifi] profile creation for {net.ssid!r} failed ({code}): '
+                f'{_error_text(out, err)}',
+                file=sys.stderr,
             )
-        else:
-            rc, out, err = _run(
-                [
-                    'connection',
-                    'up',
-                    'uuid',
-                    expected_uuid,
-                    'ifname',
-                    iface,
-                ],
-                timeout=60,
-            )
-    else:
-        rc, out, err = _connect_new(net, iface, password)
+            job.finish(False, message, code=code)
+            return
+        created_profile = True
 
+    secret = password if net.protected and password is not None else None
+    if secret is not None and not created_profile:
+        (
+            flags_rc,
+            flags_out,
+            flags_err,
+            original_autoconnect,
+        ) = _prepare_saved_psk(expected_uuid)
+        if flags_rc != 0:
+            code, message = _classify_error(flags_rc, flags_out, flags_err)
+            print(
+                f'[wifi] could not prepare saved credentials for '
+                f'{net.ssid!r} ({code}): {_error_text(flags_out, flags_err)}',
+                file=sys.stderr,
+            )
+            job.finish(False, message, code=code)
+            return
+        prepared_saved_psk = True
+        net.autoconnect = False
+
+    rc, out, err = _activate_profile(
+        expected_uuid,
+        iface,
+        password=secret,
+    )
+
+    verified = False
+    active_uuid = ''
+    detail = ''
     if rc != 0:
         code, message = _classify_error(rc, out, err)
-        needs_password = net.protected and code == 'authentication_failed'
-        print(
-            f'[wifi] connect to {net.ssid!r} failed ({code}): '
-            f'{_error_text(out, err)}',
-            file=sys.stderr,
-        )
-        job.finish(
-            False,
-            message,
-            code=code,
-            needs_password=needs_password,
-        )
-        return
+        timed_out = _nmcli_timed_out(rc, out, err)
+        timeout_stage = 'unknown'
+        if timed_out:
+            timeout_stage = (
+                'authentication'
+                if code == 'authentication_failed'
+                else _activation_timeout_stage(
+                    iface,
+                    expected_uuid,
+                    protected=net.protected,
+                )
+            )
 
-    job.set_status('Obtaining IP...')
-    verified, active_uuid, detail = _verify_connected(
-        iface,
-        expected_uuid=expected_uuid,
-        expected_ssid=net.ssid,
-    )
+            # nmcli can exhaust its wait at the same instant NetworkManager
+            # enters IP configuration or finishes activating. Give that stage
+            # the normal bounded verification window before tearing down what
+            # may already be a valid connection.
+            if timeout_stage == 'ip':
+                job.set_status('Obtaining IP...')
+                verified, active_uuid, detail = _verify_connected(
+                    iface,
+                    expected_uuid=expected_uuid,
+                    expected_ssid=net.ssid,
+                )
+                if verified:
+                    rc = 0
+
+        if rc != 0:
+            if (
+                    secret is not None
+                    and not created_profile
+                    and (
+                        code == 'dhcp_failed'
+                        or timeout_stage == 'ip'
+                    )):
+                # Reaching IP configuration proves the replacement secret was
+                # accepted. Do not make a later retry ask for it again merely
+                # because address assignment failed.
+                _reauth_required.discard(expected_uuid)
+            cancelled = True
+            if timed_out:
+                job.set_status('Stopping failed attempt...')
+                cancelled = _cancel_activation(expected_uuid, iface)
+                if code in (
+                        'authentication_failed',
+                        'network_not_found',
+                        'dhcp_failed',
+                ):
+                    pass
+                elif net.protected and timeout_stage == 'authentication':
+                    code = 'authentication_timeout'
+                    message = 'Authentication timed out'
+                elif timeout_stage == 'ip':
+                    code = 'dhcp_failed'
+                    message = 'Could not obtain IP'
+                else:
+                    code = 'timeout'
+                    message = 'Connection timed out'
+            reauth_after_cleanup = (
+                net.protected
+                and code in ('authentication_failed', 'authentication_timeout')
+            )
+            discarded = True
+            if created_profile:
+                discarded = _discard_new_profile(net, expected_uuid)
+                if timed_out and not cancelled and discarded:
+                    cancelled = _wait_activation_stopped(expected_uuid, iface)
+            cleanup_ok = (not timed_out or cancelled) and discarded
+            if not cleanup_ok:
+                _set_recovery_latch(
+                    iface,
+                    expected_uuid,
+                    delete_profile=created_profile and not discarded,
+                    network=net,
+                    reason='activation failure cleanup',
+                    reauth_required=(
+                        reauth_after_cleanup and not created_profile
+                    ),
+                )
+                code = 'cleanup_failed'
+                message = 'Could not stop connection attempt'
+            needs_password = (
+                cleanup_ok and reauth_after_cleanup
+            )
+            if needs_password and not created_profile:
+                # Keep a cancelled/ignored password prompt from causing the
+                # next Connect tap to retry the same rejected secret for
+                # another full activation timeout.
+                _reauth_required.add(expected_uuid)
+            print(
+                f'[wifi] connect to {net.ssid!r} failed ({code}): '
+                f'{_error_text(out, err)}',
+                file=sys.stderr,
+            )
+            job.finish(
+                False,
+                message,
+                code=code,
+                needs_password=needs_password,
+            )
+            return
+
+    if not verified:
+        job.set_status('Obtaining IP...')
+        verified, active_uuid, detail = _verify_connected(
+            iface,
+            expected_uuid=expected_uuid,
+            expected_ssid=net.ssid,
+        )
     if not verified:
         print(f'[wifi] connect verification failed: {detail}', file=sys.stderr)
+        if secret is not None and not created_profile:
+            # A successful activation command has already accepted the
+            # supplied secret even if UUID/IP verification later fails.
+            _reauth_required.discard(expected_uuid)
+        job.set_status('Stopping failed attempt...')
+        cancelled = _cancel_activation(expected_uuid, iface)
+        discarded = True
+        if created_profile:
+            discarded = _discard_new_profile(net, expected_uuid)
+        if not cancelled and discarded:
+            cancelled = _wait_activation_stopped(expected_uuid, iface)
+        if not cancelled or not discarded:
+            _set_recovery_latch(
+                iface,
+                expected_uuid,
+                delete_profile=created_profile and not discarded,
+                network=net,
+                reason='connection verification cleanup',
+            )
+            job.finish(
+                False,
+                'Could not stop connection attempt',
+                code='cleanup_failed',
+            )
+            return
         job.finish(False, 'Could not obtain IP', code='dhcp_failed')
         return
 
-    # Refresh the profile identity for a newly created connection.
-    if not net.profile_uuid:
-        profiles = saved_profiles()
-        profile = _profile_for_ssid(profiles, net.ssid, active_uuid)
-        if profile:
-            net.profile_name = profile.name
-            net.profile_uuid = profile.uuid
-            net.saved = True
+    net.profile_uuid = active_uuid
+    net.saved = True
     net.active = True
+    net.profile_known = True
+    _reauth_required.discard(active_uuid)
+
+    if created_profile:
+        auto_rc, auto_out, auto_err = _enable_profile_autoconnect(active_uuid)
+        if auto_rc != 0:
+            print(
+                f'[wifi] connected to {net.ssid!r}, but enabling autoconnect '
+                f'failed: {_error_text(auto_out, auto_err)}',
+                file=sys.stderr,
+            )
+            job.finish(
+                True,
+                f'Connected to {net.ssid}; auto-reconnect unavailable',
+                code='connected_warning',
+            )
+            return
+        net.autoconnect = True
+    else:
+        if (
+                not prepared_saved_psk
+                and active_uuid not in _autoconnect_restore
+                and net.autoconnect is False):
+            marker_rc, marker_out, marker_err = _load_autoconnect_restore(
+                active_uuid
+            )
+            if marker_rc != 0:
+                print(
+                    f'[wifi] connected to {net.ssid!r}, but reading pending '
+                    f'autoconnect recovery failed: '
+                    f'{_error_text(marker_out, marker_err)}',
+                    file=sys.stderr,
+                )
+                job.finish(
+                    True,
+                    f'Connected to {net.ssid}; auto-reconnect status unknown',
+                    code='connected_warning',
+                )
+                return
+        pending_autoconnect = (
+            prepared_saved_psk
+            or active_uuid in _autoconnect_restore
+        )
+        restored_value = (
+            original_autoconnect
+            if prepared_saved_psk
+            else _autoconnect_restore.get(active_uuid)
+        )
+    if not created_profile and pending_autoconnect:
+        auto_rc, auto_out, auto_err = _restore_saved_autoconnect(active_uuid)
+        if auto_rc != 0:
+            print(
+                f'[wifi] connected to {net.ssid!r}, but restoring autoconnect '
+                f'failed: {_error_text(auto_out, auto_err)}',
+                file=sys.stderr,
+            )
+            job.finish(
+                True,
+                f'Connected to {net.ssid}; auto-reconnect unavailable',
+                code='connected_warning',
+            )
+            return
+        net.autoconnect = restored_value
     job.finish(True, f'Connected to {net.ssid}', code='connected')
 
 
@@ -958,24 +1866,49 @@ def _disconnect_worker(job, net):
 
     iface = net.iface or wifi_iface()
     active = active_connection(iface)
-    profiles = saved_profiles()
-    target = _profile_for_ssid(profiles, net.ssid, active.uuid)
-    target_uuid = target.uuid if target is not None else net.profile_uuid
+    if not active.query_ok:
+        job.finish(
+            False,
+            active.error_message or 'Could not read Wi-Fi state',
+            code=active.error_code or 'state_query_failed',
+        )
+        return
 
     if not active.uuid:
         net.active = False
         job.finish(True, f'{net.ssid} is already disconnected', code='disconnected')
         return
+
+    target_uuid = net.profile_uuid
+    if target_uuid != active.uuid:
+        ssid_ok, active_ssid, detail = _profile_ssid_detailed(active.uuid)
+        if not ssid_ok:
+            print(
+                f'[wifi] active profile identity query failed: {detail}',
+                file=sys.stderr,
+            )
+            job.finish(
+                False,
+                'Could not identify active connection',
+                code='identity_failed',
+            )
+            return
+        if active_ssid != net.ssid:
+            net.active = False
+            job.finish(
+                True,
+                f'{net.ssid} is already disconnected',
+                code='disconnected',
+            )
+            return
+        target_uuid = active.uuid
+
     if not target_uuid:
         job.finish(
             False,
             'Could not identify active connection',
             code='identity_failed',
         )
-        return
-    if target_uuid != active.uuid:
-        net.active = False
-        job.finish(True, f'{net.ssid} is already disconnected', code='disconnected')
         return
 
     job.set_status('Disconnecting...')
@@ -994,8 +1927,14 @@ def _disconnect_worker(job, net):
         return
 
     deadline = time.monotonic() + 10.0
+    last_query_error = None
     while time.monotonic() < deadline:
         current = active_connection(iface)
+        if not current.query_ok:
+            last_query_error = current
+            time.sleep(0.25)
+            continue
+        last_query_error = None
         if current.uuid != active.uuid:
             net.active = False
             job.finish(
@@ -1006,6 +1945,13 @@ def _disconnect_worker(job, net):
             return
         time.sleep(0.25)
 
+    if last_query_error is not None:
+        job.finish(
+            False,
+            last_query_error.error_message or 'Could not read Wi-Fi state',
+            code=last_query_error.error_code or 'state_query_failed',
+        )
+        return
     job.finish(False, 'Disconnect could not be verified', code='disconnect_timeout')
 
 
@@ -1020,6 +1966,8 @@ def disconnect(net):
     if not _operation_lock.acquire(blocking=False):
         return False, 'Wi-Fi is busy'
     try:
+        if not _reconcile_recovery():
+            return False, 'Previous connection cleanup is still pending'
         job = WifiJob('disconnect', net.ssid)
         _disconnect_worker(job, net)
         return job.ok, job.message

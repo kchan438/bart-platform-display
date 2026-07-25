@@ -1,5 +1,6 @@
-// Allow the BART display service user to perform only the NetworkManager
-// operations exposed by the touchscreen Wi-Fi settings.
+// Allow the BART display service user to use the NetworkManager action classes
+// required by the touchscreen Wi-Fi settings. PolicyKit authorizes these
+// actions per user; it cannot restrict them to this process or one profile.
 polkit.addRule(function(action, subject) {
   var allowed = [
     "org.freedesktop.NetworkManager.wifi.scan",

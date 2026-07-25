@@ -37,6 +37,7 @@ class SettingsPanel:
         self.networks = []
         self.selected = None           # Network in detail view
         self.detail_info = []          # cached info rows for the detail view
+        self._detail_request_id = 0    # invalidates stale detail worker results
         self.scan_job = None
         self.action_job = None
         self.status = ''
@@ -100,7 +101,11 @@ class SettingsPanel:
                 after_message = self._after_scan_message
                 self._after_scan_message = ''
                 if not job.ok:
-                    self.status = job.message
+                    self.status = (
+                        f'{after_message} - {job.message}'
+                        if after_message and job.message
+                        else (after_message or job.message)
+                    )
                     self.status_kind = 'error'
                 elif after_message:
                     self.status = (
@@ -124,6 +129,10 @@ class SettingsPanel:
 
             self.action_job = None
             if job.ok:
+                if job.kind == 'disconnect':
+                    for network in self.networks:
+                        if network.ssid == job.ssid:
+                            network.active = False
                 self.selected = None
                 self.detail_info = []
                 self.scroll = 0
@@ -339,13 +348,19 @@ class SettingsPanel:
         self.selected = net
         self.status = ''
         self.view = 'wifi_detail'
+        self._detail_request_id += 1
+        request_id = self._detail_request_id
         # Show the cheap rows immediately; fetch IP/gateway (nmcli) off-thread
         # so the detail render never spawns subprocesses per frame.
         self.detail_info = wifi.info_basic(net)
         if net.active:
             def work():
-                if self.selected is net:
-                    self.detail_info = wifi.info(net)
+                info = wifi.info(net)
+                if (
+                        self._detail_request_id == request_id
+                        and self.selected is net
+                        and self.view == 'wifi_detail'):
+                    self.detail_info = info
             threading.Thread(target=work, daemon=True).start()
 
     # -- Wi-Fi detail -------------------------------------------------------
@@ -451,12 +466,16 @@ class SettingsPanel:
             self.status = 'Unsupported network security'
             self.status_kind = 'error'
             return
-        if net.protected and not net.saved:
+        if net.protected and not net.saved and net.profile_known:
             self._open_keyboard('Password: ' + net.ssid, '', password=True,
                                 on_submit=self._connect_with_password)
         else:
             self.action_job = wifi.connect_async(net)
-            self.status = 'Connecting...'
+            self.status = (
+                'Checking saved network...'
+                if not net.profile_known
+                else 'Connecting...'
+            )
             self.status_kind = 'info'
 
     def _connect_with_password(self, password):

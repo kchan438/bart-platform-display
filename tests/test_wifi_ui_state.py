@@ -63,9 +63,96 @@ with mock.patch.dict(
             'bartdisplay.ui.widgets': fake_widgets,
         }):
     from bartdisplay.ui.settings import SettingsPanel
+    settings_module = sys.modules[SettingsPanel.__module__]
 
 
 class WifiUiStateTests(unittest.TestCase):
+    def test_detail_worker_does_not_overwrite_newer_ui_state(self):
+        panel = SettingsPanel()
+        original = wifi.Network('Original', active=True)
+        replacement = wifi.Network('Replacement')
+        stale_info = [('SSID', original.ssid), ('IP', '192.0.2.10')]
+
+        with mock.patch.object(wifi, 'info', return_value=stale_info), \
+                mock.patch.object(
+                    settings_module.threading,
+                    'Thread',
+                ) as thread_class:
+            panel._select(original)
+            worker = thread_class.call_args.kwargs['target']
+
+            panel._select(replacement)
+            replacement_info = panel.detail_info
+            worker()
+
+            self.assertIs(panel.selected, replacement)
+            self.assertEqual(panel.detail_info, replacement_info)
+
+            panel.selected = original
+            panel.view = 'wifi'
+            panel.detail_info = [('sentinel', 'list view')]
+            worker()
+
+            self.assertEqual(panel.detail_info, [('sentinel', 'list view')])
+
+    def test_older_detail_worker_cannot_overwrite_reopened_same_network(self):
+        panel = SettingsPanel()
+        network = wifi.Network('Home', active=True)
+        older_info = [('SSID', network.ssid), ('IP', '192.0.2.10')]
+        newer_info = [('SSID', network.ssid), ('IP', '192.0.2.11')]
+
+        with mock.patch.object(
+                settings_module.threading,
+                'Thread',
+        ) as thread_class:
+            panel._select(network)
+            older_worker = thread_class.call_args.kwargs['target']
+
+            panel.view = 'wifi'
+            panel._select(network)
+            newer_worker = thread_class.call_args.kwargs['target']
+
+        with mock.patch.object(wifi, 'info', return_value=newer_info):
+            newer_worker()
+        with mock.patch.object(wifi, 'info', return_value=older_info):
+            older_worker()
+
+        self.assertEqual(panel.detail_info, newer_info)
+
+    def test_protected_unsaved_network_opens_password_keyboard(self):
+        panel = SettingsPanel()
+        network = wifi.Network('Cafe', security='WPA2', saved=False)
+        panel.selected = network
+        panel.view = 'wifi_detail'
+
+        panel._do_connect()
+
+        self.assertIsInstance(panel.keyboard, FakeKeyboard)
+        self.assertEqual(panel.keyboard.title, 'Password: Cafe')
+        self.assertEqual(panel.keyboard.initial, '')
+        self.assertTrue(panel.keyboard.password)
+        self.assertIsNone(panel.action_job)
+
+    def test_unknown_saved_state_is_resolved_before_password_prompt(self):
+        panel = SettingsPanel()
+        network = wifi.Network(
+            'Cafe',
+            security='WPA2',
+            saved=False,
+            profile_known=False,
+        )
+        panel.selected = network
+        panel.view = 'wifi_detail'
+        job = wifi.WifiJob('connect', network.ssid)
+
+        with mock.patch.object(wifi, 'connect_async', return_value=job) as connect:
+            panel._do_connect()
+
+        self.assertIsNone(panel.keyboard)
+        self.assertIs(panel.action_job, job)
+        self.assertEqual(panel.status, 'Checking saved network...')
+        connect.assert_called_once_with(network)
+
     def test_disconnect_failure_stays_on_detail_and_shows_error(self):
         panel = SettingsPanel()
         network = wifi.Network('Home', active=True)
@@ -86,6 +173,7 @@ class WifiUiStateTests(unittest.TestCase):
     def test_disconnect_success_returns_to_list_and_starts_scan(self):
         panel = SettingsPanel()
         network = wifi.Network('Home', active=True)
+        panel.networks = [network]
         panel.selected = network
         panel.view = 'wifi_detail'
         action = wifi.WifiJob('disconnect', network.ssid)
@@ -101,6 +189,7 @@ class WifiUiStateTests(unittest.TestCase):
         self.assertIs(panel.scan_job, scan)
         self.assertEqual(panel._after_scan_message, 'Disconnected from Home')
         self.assertEqual(panel.status, 'Scanning...')
+        self.assertFalse(network.active)
 
         scan.finish(
             True,
@@ -114,6 +203,52 @@ class WifiUiStateTests(unittest.TestCase):
             panel.status,
             'Disconnected from Home - Showing recent results',
         )
+
+    def test_failed_follow_up_scan_keeps_disconnect_confirmation(self):
+        panel = SettingsPanel()
+        network = wifi.Network('Home', active=True)
+        panel.networks = [network]
+        panel.selected = network
+        panel.view = 'wifi_detail'
+        action = wifi.WifiJob('disconnect', network.ssid)
+        action.finish(True, 'Disconnected from Home', code='disconnected')
+        panel.action_job = action
+        scan = wifi.WifiJob('scan')
+
+        with mock.patch.object(wifi, 'scan_async', return_value=scan):
+            panel._update_wifi_jobs()
+
+        scan.finish(False, 'Scan failed', code='scan_failed', networks=[])
+        panel._update_wifi_jobs()
+
+        self.assertEqual(panel.networks, [network])
+        self.assertFalse(network.active)
+        self.assertEqual(
+            panel.status,
+            'Disconnected from Home - Scan failed',
+        )
+        self.assertEqual(panel.status_kind, 'error')
+
+    def test_empty_follow_up_scan_keeps_disconnect_confirmation(self):
+        panel = SettingsPanel()
+        network = wifi.Network('Home', active=True)
+        panel.networks = [network]
+        panel.selected = network
+        panel.view = 'wifi_detail'
+        action = wifi.WifiJob('disconnect', network.ssid)
+        action.finish(True, 'Disconnected from Home', code='disconnected')
+        panel.action_job = action
+        scan = wifi.WifiJob('scan')
+
+        with mock.patch.object(wifi, 'scan_async', return_value=scan):
+            panel._update_wifi_jobs()
+
+        scan.finish(True, '', networks=[])
+        panel._update_wifi_jobs()
+
+        self.assertEqual(panel.networks, [])
+        self.assertEqual(panel.status, 'Disconnected from Home')
+        self.assertEqual(panel.status_kind, 'success')
 
     def test_saved_authentication_failure_reopens_password_keyboard(self):
         panel = SettingsPanel()

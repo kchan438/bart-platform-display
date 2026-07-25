@@ -169,20 +169,49 @@ adapter's automatic activation state and previously selected the wrong semantic.
 - Saved network without a supplied password:
   activate the saved profile UUID.
 - Saved network with a replacement password:
-  provide the secret through a mode-0600 password file and activate the same
-  UUID.
+  atomically disable autoconnect, record its original value in NetworkManager
+  profile user data, clear the stale PSK, then provide the replacement secret
+  through a mode-0600 password file and activate the same UUID. Restore the
+  original autoconnect value and remove the recovery marker only after a
+  verified connection; the marker must survive an application restart.
 - New protected network:
-  use NetworkManager's interactive/stdin credential flow so the password does
-  not appear in argv.
+  generate the UUID before creation, create that exact profile
+  non-interactively with autoconnect disabled, then provide the secret through
+  a mode-0600 password file while activating that UUID.
+- Mark WPA Personal secrets as system-owned (`psk-flags=0`) so the authorized
+  NetworkManager service persists a successful password for later reconnects;
+  apply the same flag before supplying a replacement password to a saved
+  profile.
 - New open network:
-  connect without a password.
+  create and activate a UUID-addressed profile without a password.
+- Never use `nmcli --ask` from the headless service. It is an interactive flow
+  that can wait for hidden password or PolicyKit prompts.
+- Give `nmcli` an explicit activation wait and keep the subprocess deadline
+  longer than NetworkManager's deadline so the real terminal error is retained.
+- Enable autoconnect only after the new profile is verified with an IPv4
+  address.
 - Use the selected interface. Do not persistently pin a newly created profile
   to one BSSID, because that would break roaming across mesh access points.
 - Preserve password whitespace and supported symbols.
 - Verify the active UUID/SSID, device state, and IPv4 assignment before
   reporting success.
-- Refresh saved profile identity after NetworkManager creates a new profile.
+- Assign a UUID before asking NetworkManager to create a profile so an
+  ambiguous create timeout can still be reconciled safely.
 - Authentication failure on a protected network must request password entry.
+- Inspect NetworkManager device state/reason before classifying an activation
+  timeout. Wi-Fi association, missing-secret, and supplicant-failure states are
+  authentication-stage failures and may request a password. IP/DHCP-stage
+  timeouts must report an address-assignment failure instead.
+- When `nmcli` reaches its wait deadline during IP configuration, allow the
+  bounded UUID-and-IPv4 verification to salvage a connection that completed at
+  the deadline before attempting cancellation.
+- A timed-out activation must be cancelled and verified stopped before another
+  scan, connect, or disconnect operation may begin. If immediate cleanup cannot
+  be verified, keep a recovery gate active and retry cleanup at the start of
+  every later operation. Protected-network timeouts may offer password entry
+  again only after cleanup is verified.
+- Delete an unverified profile created by a failed first-time attempt; never
+  leave it eligible for autoconnect or let retries accumulate duplicates.
 - Unsupported security must be identified before attempting a connection.
 
 ### UI requirements
@@ -197,6 +226,10 @@ adapter's automatic activation state and previously selected the wrong semantic.
 - A failed post-action scan takes precedence over the confirmation and explains
   that recent results are being shown.
 - Saved authentication failure opens the password keyboard automatically.
+- Wi-Fi passwords start masked and have a labeled, touchscreen-sized
+  `SHOW`/`HIDE` control that does not modify the entered text.
+- The keyboard-dismiss control is labeled `CLOSE` so it cannot be confused with
+  password visibility.
 - Enterprise, WEP, and WPA1 networks show `UNSUPPORTED`.
 
 ## Error categories
@@ -209,11 +242,14 @@ adapter's automatic activation state and previously selected the wrong semantic.
 - `not_authorized`
 - `authentication_required`
 - `authentication_failed`
+- `authentication_timeout`
+- `cleanup_failed`
 - `network_not_found`
 - `identity_failed`
 - `unsupported`
 - `dhcp_failed`
 - `connect_failed`
+- `connected_warning`
 - `disconnect_failed`
 - `disconnect_timeout`
 - `unexpected`
@@ -268,8 +304,14 @@ Automated tests must cover:
 - Disconnect authorization failure
 - Saved UUID activation
 - Saved authentication failure and password retry
+- Non-interactive new-profile creation, failed-profile cleanup, and saved UUID
+  reuse after failed authentication
+- Explicit NetworkManager wait shorter than the subprocess deadline
+- WPA2/WPA3 Personal key-management selection
+- Absence of `--ask` from every connection path
 - Password absence from argv
 - Mode-0600 temporary secret file and cleanup
+- Password show/hide touch behavior and default masking
 - Unsupported security detection
 
 Hardware validation must cover:
@@ -299,6 +341,26 @@ Hardware validation must cover:
 - A saved network reconnects without password entry.
 - A stale saved password triggers password entry and a successful retry updates
   the usable profile without duplicates.
+- A typed replacement password is requested by NetworkManager rather than being
+  shadowed by the previously stored PSK.
+- A replacement-password attempt interrupted by an application restart restores
+  the profile's original autoconnect preference after the next verified success.
+- No connection command uses `nmcli --ask`.
+- A wrong password returns a visible authentication failure rather than a
+  generic subprocess timeout.
+- A timed-out activation is verified stopped before password retry is offered;
+  cancellation failure is visible and a recovery gate blocks every later Wi-Fi
+  operation until cleanup succeeds.
+- Dismissing a password prompt after saved-profile authentication fails does
+  not retry the same rejected secret; the next Connect tap prompts immediately.
+- A timeout in NetworkManager's IP-configuration stage does not prompt the user
+  to replace a correct password.
+- An activation that completes with the expected UUID and IPv4 address at the
+  `nmcli` deadline is retained and reported as connected.
+- A connection whose activation succeeds but autoconnect setup fails reports
+  that auto-reconnect is unavailable instead of claiming full success.
+- Password entry is masked by default and exposes an explicit `SHOW`/`HIDE`
+  button.
 - Successful connection is not reported until an IPv4 address exists.
 - No password is present in process arguments, application logs, or
   NetworkManager logs generated by the application.

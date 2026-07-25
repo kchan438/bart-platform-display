@@ -1,8 +1,9 @@
 """On-screen keyboard for 480x320 touch input.
 
 Used for Wi-Fi passwords and the BART API key. Supports uppercase (shift), a
-symbols page, backspace, space, a Done action, and a dedicated Hide button that
-dismisses the keyboard without submitting. Password fields get a show/hide eye.
+symbols page, backspace, space, a Done action, and a dedicated Close button that
+dismisses the keyboard without submitting. Password fields get a labeled
+Show/Hide control.
 """
 
 import pygame
@@ -29,12 +30,15 @@ _SYMBOL_ROWS = [
 _WEIGHTS = {'SHIFT': 1.6, 'BKSP': 1.6, 'SYM': 1.6, 'ABC': 1.6,
             'HIDE': 2.0, 'DONE': 2.0, 'SPACE': 4.4}
 _LABELS = {'SHIFT': 'aA', 'BKSP': 'DEL', 'SYM': '?#', 'ABC': 'ABC',
-           'HIDE': 'HIDE', 'DONE': 'DONE', 'SPACE': 'SPACE'}
+           'HIDE': 'CLOSE', 'DONE': 'DONE', 'SPACE': 'SPACE'}
 
 _KEYS_TOP = 74
 _ROW_H = 46
 _ROW_GAP = 2
 _KEY_GAP = 2
+_FIELD_Y = 30
+_FIELD_H = 40
+_PASSWORD_TOGGLE_W = 108
 
 
 class Keyboard:
@@ -49,7 +53,18 @@ class Keyboard:
         self._shift = False
         self._symbols = False
         self._keys = []       # list of (token, pygame.Rect)
-        self._eye_rect = None
+        # Create the password toggle hitbox immediately so it works even before
+        # the first render following a view transition.
+        self._password_toggle_rect = (
+            pygame.Rect(
+                W - PAD - _PASSWORD_TOGGLE_W,
+                _FIELD_Y,
+                _PASSWORD_TOGGLE_W,
+                _FIELD_H,
+            )
+            if self.password
+            else None
+        )
         self._layout()
 
     # -- layout -------------------------------------------------------------
@@ -78,7 +93,9 @@ class Keyboard:
         if event.get('kind') != 'release' or not event.get('tap'):
             return
         x, y = event['x'], event['y']
-        if self._eye_rect and self._eye_rect.collidepoint(x, y):
+        if (
+                self._password_toggle_rect
+                and self._password_toggle_rect.collidepoint(x, y)):
             self.reveal = not self.reveal
             return
         for tok, rect in self._keys:
@@ -116,20 +133,35 @@ class Keyboard:
         display.blit_left(self.title, display.font_xs, C['on'], PAD, 8)
 
         # Text field
-        field = pygame.Rect(PAD, 34, W - 2 * PAD, 32)
+        field = pygame.Rect(PAD, _FIELD_Y, W - 2 * PAD, _FIELD_H)
         pygame.draw.rect(screen, C['bg'], field)
         pygame.draw.rect(screen, C['dim'], field, 1)
         shown = self.text if (self.reveal or not self.password) else '*' * len(self.text)
+        text_right_reserve = (
+            _PASSWORD_TOGGLE_W + 12 if self.password else 12
+        )
         shown = display.truncate(shown, display.font_sm,
-                                 field.width - (34 if self.password else 12))
-        display.blit_left(shown or '', display.font_sm, C['white'], field.x + 6, field.y + 7)
+                                 field.width - text_right_reserve)
+        display.blit_left(
+            shown or '',
+            display.font_sm,
+            C['white'],
+            field.x + 6,
+            field.y + 10,
+        )
         if self.password:
-            self._eye_rect = pygame.Rect(field.right - 30, field.y, 30, field.height)
-            eye_col = C['on'] if self.reveal else C['dim']
-            display.blit_center('o' if self.reveal else '-', display.font_sm, eye_col,
-                                self._eye_rect.centerx, self._eye_rect.y + 7)
-        else:
-            self._eye_rect = None
+            toggle = self._password_toggle_rect
+            pygame.draw.rect(screen, C['panel_hi'], toggle)
+            pygame.draw.rect(screen, C['dim'], toggle, 1)
+            label = 'HIDE' if self.reveal else 'SHOW'
+            label_color = C['arrive'] if self.reveal else C['on']
+            display.blit_center(
+                label,
+                display.font_xs,
+                label_color,
+                toggle.centerx,
+                toggle.y + 12,
+            )
 
         # Keys
         for tok, rect in self._keys:
