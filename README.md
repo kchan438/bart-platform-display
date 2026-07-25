@@ -17,12 +17,75 @@ SSH remains enabled so you can modify the project remotely at any time.
 
 ```
 bart-platform-display/
-├── main.py                         # pygame app
+├── main.py                         # entry point: render loop + input dispatch
+├── bartdisplay/                    # application package
+│   ├── config.py                   # config.json load/save (thread-safe)
+│   ├── display.py                  # pygame + framebuffer output, fonts, palette
+│   ├── departures.py               # BART ETD fetch (background thread)
+│   ├── board.py                    # main departure-board render
+│   ├── touch.py                    # XPT2046 evdev reader + gesture recognizer
+│   ├── wifi.py                     # nmcli wrapper (scan/connect/disconnect/info)
+│   └── ui/                         # swipe-down settings panel
+│       ├── widgets.py              # buttons + icon helpers
+│       ├── keyboard.py             # on-screen keyboard
+│       └── settings.py            # Wi-Fi + API-key panel
+├── deploy/
+│   └── polkit/                    # minimal NetworkManager authorization
+├── docs/product/                  # implementation-ready product requirements
+├── tests/                         # Wi-Fi lifecycle regression tests
 ├── config.json                     # station, platform, API key
 ├── requirements.txt
 ├── fonts/
 │   └── PressStart2P-Regular.ttf    # must be downloaded (see below)
 └── bart-platform-display.service   # systemd unit for auto-start
+```
+
+## On-device settings panel
+
+The device is configured entirely from the touchscreen — no SSH needed:
+
+- **Swipe down** from the top edge to open the settings shade; **swipe up** to
+  return to the departure board.
+- **Wi-Fi**: scan and list networks with signal strength, encryption, a *SAVED*
+  tag for known networks, and the connected network marked *ONLINE*. Tap a
+  network to Connect / Disconnect or view its info. Password-protected networks
+  prompt for a password via the on-screen keyboard, with a large **Show/Hide**
+  password button and a separate **Close** keyboard button.
+  Live connection, authentication, IP-assignment, and disconnect status is
+  shown. Recent results remain visible when a scan temporarily fails. Networks
+  are saved by NetworkManager and auto-reconnect on boot.
+- **BART API Key**: shows the current key; **Modify** edits it with the keyboard
+  and **Save** writes it to `config.json`. A new key applies on the next poll
+  (~30 s) without a restart; a **Restart App** button is offered to apply it
+  immediately.
+
+### Wi-Fi permissions (NetworkManager)
+
+Wi-Fi control uses `nmcli`. The app runs as the `kevinchan` user in a headless
+systemd service, so PolicyKit cannot show an interactive authentication prompt.
+Install the repository's service-user-scoped rule:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  deploy/polkit/50-bart-platform-display-networkmanager.rules \
+  /etc/polkit-1/rules.d/
+sudo systemctl restart polkit
+nmcli general permissions
+```
+
+The rule grants Wi-Fi scanning plus NetworkManager's `network-control` and
+system-profile modification action classes to `kevinchan`. The relevant
+permissions should report `yes`. The app remains non-root and is not authorized
+to toggle the Wi-Fi radio. PolicyKit applies these grants to every process
+running as `kevinchan` and cannot limit them to this application or to Wi-Fi
+profiles, so use a dedicated service account if that broader per-user boundary
+is not acceptable.
+
+To roll the permission change back:
+
+```bash
+sudo rm /etc/polkit-1/rules.d/50-bart-platform-display-networkmanager.rules
+sudo systemctl restart polkit
 ```
 
 ---
@@ -146,6 +209,17 @@ python main.py
 
 The TFT should show the departure board. Press `Ctrl+C` to exit.
 
+### Develop on a desktop (no Pi)
+
+Set `BART_DEV=1` to run in a normal window instead of the framebuffer, with the
+mouse standing in for touch (click = tap, click-drag = swipe/scroll). Wi-Fi and
+touch hardware are mocked, so the settings panel UI can be built and tested off
+the Pi:
+
+```bash
+BART_DEV=1 python main.py
+```
+
 ---
 
 ## 6 — Enable auto-start at boot
@@ -214,6 +288,8 @@ sudo systemctl restart bart-platform-display
 | Display stays white, `dd if=/dev/zero of=/dev/fb0` has no effect | fbcon is still active and overwriting the framebuffer — confirm `fbcon=map:10` is in `/boot/firmware/cmdline.txt` |
 | `Font not found` error | Place `PressStart2P-Regular.ttf` in `fonts/` |
 | `LOADING...` stays forever | Check internet; run `journalctl -u bart-platform-display -f` for errors |
+| Wi-Fi action shows `Not authorized` | Reinstall the scoped PolicyKit rule above and confirm the required `nmcli general permissions` rows report `yes` |
+| A correct Wi-Fi password still times out | Run `journalctl -u bart-platform-display -u NetworkManager --since "-5 minutes" --no-pager` and inspect the terminal NetworkManager reason |
 | pip pygame build fails | Use system pygame: `sudo apt install python3-pygame` and create venv with `--system-site-packages` |
 
 ---
