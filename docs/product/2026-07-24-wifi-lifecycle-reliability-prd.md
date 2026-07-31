@@ -1,11 +1,13 @@
 # Wi-Fi Lifecycle Reliability PRD
 
-- Status: Approved for implementation
+- Status: Hardening implemented locally; Raspberry Pi validation pending
 - Date: 2026-07-24
+- Hardening update: 2026-07-30
 - Product: BART Platform Display
 - Target: Raspberry Pi Zero W, Raspberry Pi OS 13 (trixie), 480x320 touchscreen
 - Base branch at planning time: `feature/wifi-scanning-fix`
 - Implementation branch: `fix/wifi-lifecycle-reliability`
+- Hardening branch: `fix/wifi-reliability-hardening`
 
 ## Summary
 
@@ -79,9 +81,9 @@ from this document.
 
 ### Scan
 
-As a user, I can open Wi-Fi settings at any time and immediately see
-NetworkManager's cached nearby networks without forcing another hardware scan.
-Only the explicit RESCAN control requests a new radio scan.
+As a user, I can open Wi-Fi settings at any time and immediately see the
+application's last retained list without any implicit refresh. Only the
+explicit RESCAN control reads updated AP state or requests radio scans.
 
 As a user, if a scan temporarily fails, I see a useful error and recent results
 instead of an unexplained empty list.
@@ -133,23 +135,29 @@ profiles by UUID.
 
 ### Fresh scanning
 
-Opening the Wi-Fi list, returning from network detail, and completing a
-connect/disconnect action must not trigger a hardware scan. Those paths may read
-NetworkManager's cached AP state with `--rescan no`. When the user explicitly
-selects RESCAN:
+Opening the Wi-Fi list, returning from network detail, completing a
+connect/disconnect action, and idle UI updates must not trigger a hardware scan
+or a cache-only AP refresh. Those paths reconcile the retained rows locally.
+When the user explicitly selects RESCAN:
 
 1. Confirm that NetworkManager reports the Wi-Fi radio enabled. Do not
    automatically toggle it.
 2. Resolve the real Wi-Fi device, excluding Wi-Fi Direct pseudo-devices.
-3. Read NetworkManager's `LastScan` value.
-4. Request a targeted rescan for that interface.
-5. Wait with a bounded timeout for `LastScan` to advance.
-6. Read NetworkManager's cached AP list only after completion.
-7. De-duplicate by SSID, selecting the active AP or strongest AP.
-8. Preserve the connected SSID even if a degraded scan omits it.
-9. Merge recently seen missing SSIDs for a short bounded TTL and mark the
+3. Run two targeted scan passes. For each pass, read NetworkManager's `LastScan`
+   value, request a rescan, and wait with a bounded timeout for `LastScan` to
+   advance.
+4. Read NetworkManager's cached AP list only after each completed pass.
+5. Union BSSIDs across all passes, then de-duplicate by SSID while selecting the
+   confirmed in-use AP or strongest detected AP.
+6. Run one additional bounded pass only when the union has collapsed below
+   half of a meaningful recent baseline.
+7. Preserve the connected SSID and every saved SSID even when scans omit them.
+   Mark saved-only rows `NOT DETECTED`; do not show invented signal or security.
+8. Merge recently seen missing SSIDs for a short bounded TTL and mark the
    aggregate result partial.
-10. Expire missing results after the TTL.
+9. Expire missing unsaved results after the TTL.
+10. Show detected/recent/saved-not-detected counts plus a degraded or failed
+    completion reason.
 
 The application must not use `sudo iw scan` in production. Raw scanning remains
 diagnostic evidence only.
@@ -220,23 +228,46 @@ adapter's automatic activation state and previously selected the wrong semantic.
   leave it eligible for autoconnect or let retries accumulate duplicates.
 - Unsupported security must be identified before attempting a connection.
 
+### Connection supervision and recovery
+
+- Verify and read back `connection.autoconnect=yes` after every successful
+  connection. A failed readback is a visible connected warning.
+- Continuously observe the active Wi-Fi UUID, device state/reason, and IPv4
+  presence without triggering scans.
+- Give NetworkManager a 20-second grace period to recover an unexpected drop.
+- If the failure is transient, make no more than two retries using the exact
+  saved profile UUID. Never recreate the profile during recovery.
+- Never fight NetworkManager while it activates the watched profile or another
+  saved profile; adopt a different profile when it reaches active IPv4 state.
+- Never retry an intentional disconnect or an authentication failure.
+- Validate that the watched UUID still maps to the expected SSID before
+  activation.
+- Cancel and verify every failed supervisor activation before releasing the
+  operation gate. If cleanup cannot be verified, latch the cleanup failure and
+  block further mutations until reconciliation succeeds.
+- Publish grace, recovering, reconnected, authentication, and terminal failure
+  states to the touchscreen without overwriting a foreground operation.
+
 ### UI requirements
 
-- Rescan is disabled while any Wi-Fi operation is active.
+- Rescan and connect/disconnect are disabled while a foreground operation or
+  supervisor recovery mutation is active. Navigation remains available during
+  background recovery.
 - Network rows are not tappable during a conflicting operation.
 - Back navigation is disabled during connect/disconnect.
 - Status messages are visible, color coded, and wrapped to at most two
   width-bounded lines so the classified failure reason remains readable.
 - Disconnect remains on the detail page until it succeeds.
-- Opening the list performs a cache-only refresh; only RESCAN requests a
-  hardware scan.
+- Opening the list performs no refresh; only RESCAN requests or reads scan
+  results.
 - Returning from network detail preserves the current list and scroll position
   without starting another scan.
-- Successful connect/disconnect returns to the list and refreshes cached
-  NetworkManager state without a hardware scan.
-- A successful post-action refresh retains the action confirmation.
-- A failed post-action refresh takes precedence over the confirmation and explains
-  that recent results are being shown.
+- Successful connect/disconnect returns to the list, updates retained rows
+  locally, and preserves the action confirmation.
+- Saved-only and recent rows do not show current signal bars. Saved-only rows
+  with unknown security do not claim to be open networks.
+- Supervisor messages reconcile active rows by profile UUID and remain visible
+  when the Wi-Fi view is opened.
 - The active network is first, followed by other saved networks, then unsaved
   networks in the same combined list.
 - A right-side scrollbar provides touchscreen-sized up/down buttons and a
@@ -254,7 +285,11 @@ adapter's automatic activation state and previously selected the wrong semantic.
 - `radio_disabled`
 - `radio_unavailable`
 - `scan_timeout`
+- `scan_verification_failed`
 - `scan_failed`
+- `adapter_missing`
+- `adapter_unmanaged`
+- `adapter_unavailable`
 - `not_authorized`
 - `authentication_required`
 - `authentication_failed`
@@ -262,8 +297,12 @@ adapter's automatic activation state and previously selected the wrong semantic.
 - `cleanup_failed`
 - `network_not_found`
 - `identity_failed`
+- `profile_identity_changed`
 - `unsupported`
 - `dhcp_failed`
+- `ip_conflict`
+- `captive_portal`
+- `internet_unavailable`
 - `connect_failed`
 - `connected_warning`
 - `disconnect_failed`
@@ -272,10 +311,12 @@ adapter's automatic activation state and previously selected the wrong semantic.
 
 Raw NetworkManager details may be written to the journal only when they contain
 no secret. Passwords and password-file contents must never be logged.
-Cache refreshes log a secret-free device-state snapshot containing the
+Manual scans log a secret-free device-state snapshot containing the
 NetworkManager state/reason, whether an active profile exists, saved-profile
 count, and how many profiles have autoconnect disabled. SSIDs, profile names,
 UUIDs, and passwords are excluded from that snapshot.
+The connection supervisor logs only its phase, stable error code, and numeric
+NetworkManager reason.
 
 ## Minimal PolicyKit deployment
 
@@ -333,8 +374,13 @@ Automated tests must cover:
 - Mode-0600 temporary secret file and cleanup
 - Password show/hide touch behavior and default masking
 - Unsupported security detection
-- Cache-only list entry and post-action refresh
+- List entry, navigation, post-action state changes, and idle updates without
+  any implicit refresh
 - Explicit-only hardware rescanning
+- Multi-pass union and conditional third-pass collapse recovery
+- Saved-but-not-detected and active-but-undetected presentation
+- Supervisor grace, bounded exact-UUID retries, retry suppression, cleanup
+  latching, and terminal error retention
 - Active/saved/unsaved list ordering
 - Scrollbar button movement, thumb dragging, and bounds clamping
 
@@ -345,7 +391,7 @@ Hardware validation must cover:
 - Repeated rescans
 - Rescan after 5, 15, and 30 minutes
 - Verified disconnect with profile retained
-- Cache-only state refresh immediately after disconnect
+- Local retained-row reconciliation immediately after disconnect
 - Saved-first ordering and scrollbar use on the physical touchscreen
 - Saved reconnect
 - Wrong password followed by correct password
@@ -361,6 +407,8 @@ Hardware validation must cover:
   restart.
 - `LastScan` advances only after the user selects RESCAN, not while opening the
   list, returning from detail, or completing connect/disconnect.
+- One RESCAN tap completes at least two verified passes and unions their SSIDs;
+  a severe collapse runs no more than one extra pass.
 - The active and saved networks remain at the top of the combined list.
 - The list is navigable with the right-side up/down buttons and draggable
   scrollbar thumb without dragging the list body.
@@ -370,6 +418,9 @@ Hardware validation must cover:
 - Disconnect failure is visible and does not navigate away.
 - After PolicyKit installation, required permissions report `yes`.
 - A saved network reconnects without password entry.
+- An unexpected transient drop receives a NetworkManager grace period and no
+  more than two exact-UUID recovery attempts; intentional and authentication
+  failures receive no automatic retry.
 - A stale saved password triggers password entry and a successful retry updates
   the usable profile without duplicates.
 - A typed replacement password is requested by NetworkManager rather than being

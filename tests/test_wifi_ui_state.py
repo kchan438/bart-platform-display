@@ -152,22 +152,34 @@ class WifiUiStateTests(unittest.TestCase):
             - settings_module._STATUS_ACTION_GAP,
         )
 
-    def test_entering_wifi_uses_cached_refresh_without_hardware_rescan(self):
+    def test_entering_wifi_does_not_scan_and_prompts_for_rescan(self):
         panel = SettingsPanel()
         panel.view = 'menu'
-        job = wifi.WifiJob('scan')
 
-        with mock.patch.object(wifi, 'scan_async', return_value=job) as scan:
+        with mock.patch.object(wifi, 'scan_async') as scan:
             panel._goto('wifi')
 
-        scan.assert_called_once_with(rescan=False)
-        self.assertIs(panel.scan_job, job)
-        self.assertEqual(panel.status, 'Refreshing...')
+        scan.assert_not_called()
+        self.assertIsNone(panel.scan_job)
+        self.assertEqual(panel.status, 'Press Rescan to find nearby networks')
+
+    def test_idle_updates_never_start_a_scan(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'wifi'
+
+        with mock.patch.object(wifi, 'scan_async') as scan:
+            for _ in range(10):
+                panel.update(16)
+
+        scan.assert_not_called()
+        self.assertIsNone(panel.scan_job)
 
     def test_returning_from_detail_preserves_list_and_scroll_without_refresh(self):
         panel = SettingsPanel()
         panel.view = 'wifi_detail'
         panel.scroll = -80
+        panel.scan_summary = '6 detected, 1 recent'
 
         with mock.patch.object(wifi, 'scan_async') as scan:
             panel._goto('wifi')
@@ -175,6 +187,7 @@ class WifiUiStateTests(unittest.TestCase):
         scan.assert_not_called()
         self.assertEqual(panel.view, 'wifi')
         self.assertEqual(panel.scroll, -80)
+        self.assertEqual(panel.status, '6 detected, 1 recent')
 
     def test_explicit_scan_requests_hardware_rescan(self):
         panel = SettingsPanel()
@@ -185,6 +198,416 @@ class WifiUiStateTests(unittest.TestCase):
 
         scan.assert_called_once_with(rescan=True)
         self.assertEqual(panel.status, 'Scanning...')
+
+    def test_empty_message_is_hidden_until_a_scan_finishes(self):
+        panel = SettingsPanel()
+
+        self.assertFalse(panel._show_empty_scan_result())
+
+        panel.scan_summary = '0 detected; No networks found'
+        self.assertFalse(panel._show_empty_scan_result())
+
+        panel.last_scan_completed_at = 1234.5
+        self.assertTrue(panel._show_empty_scan_result())
+
+    def test_supervisor_recovery_disables_wifi_controls(self):
+        panel = SettingsPanel()
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_recovery_busy',
+                return_value=True,
+        ):
+            self.assertTrue(panel._wifi_mutation_busy())
+            self.assertFalse(panel._wifi_busy())
+
+    def test_foreground_job_keeps_supervisor_notice_pending(self):
+        panel = SettingsPanel()
+        panel.view = 'wifi'
+        panel.status = 'Connecting...'
+        panel.action_job = wifi.WifiJob('connect', 'Home')
+        snapshot = wifi.ConnectionStatus(
+            sequence=1,
+            phase='failed',
+            code='ssid_not_found',
+            message='Saved network is not currently visible',
+            profile_uuid='uuid-home',
+        )
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=snapshot,
+        ):
+            panel._update_connection_supervisor()
+
+        self.assertEqual(panel._supervisor_sequence, 0)
+        self.assertEqual(panel.status, 'Connecting...')
+
+    def test_supervisor_reconnect_updates_active_row_and_notice(self):
+        panel = SettingsPanel()
+        panel.view = 'wifi'
+        previous = wifi.Network(
+            'Cafe',
+            saved=True,
+            active=True,
+            profile_uuid='uuid-cafe',
+        )
+        restored = wifi.Network(
+            'Holmes Guest',
+            saved=True,
+            profile_uuid='uuid-holmes',
+        )
+        panel.networks = [previous, restored]
+        snapshot = wifi.ConnectionStatus(
+            sequence=2,
+            phase='reconnected',
+            code='reconnected',
+            message='Reconnected to Holmes Guest',
+            ssid='Holmes Guest',
+            profile_uuid='uuid-holmes',
+            active_uuid='uuid-holmes',
+            reason_code=0,
+        )
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=snapshot,
+        ):
+            panel._update_connection_supervisor()
+
+        self.assertFalse(previous.active)
+        self.assertTrue(restored.active)
+        self.assertEqual(panel.status, 'Reconnected to Holmes Guest')
+        self.assertEqual(panel.status_kind, 'success')
+        self.assertEqual(panel._supervisor_sequence, 2)
+
+    def test_supervisor_reconnect_falls_back_to_matching_ssid(self):
+        panel = SettingsPanel()
+        previous = wifi.Network(
+            'Cafe',
+            saved=True,
+            active=True,
+            profile_uuid='uuid-cafe',
+        )
+        restored = wifi.Network(
+            'Holmes Guest',
+            saved=True,
+            profile_known=False,
+            profile_uuid='',
+        )
+        panel.networks = [previous, restored]
+        snapshot = wifi.ConnectionStatus(
+            sequence=1,
+            phase='reconnected',
+            code='reconnected',
+            message='Reconnected to Holmes Guest',
+            ssid='Holmes Guest',
+            profile_uuid='uuid-holmes',
+            active_uuid='uuid-holmes',
+        )
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=snapshot,
+        ):
+            panel._update_connection_supervisor()
+
+        self.assertFalse(previous.active)
+        self.assertTrue(restored.active)
+        self.assertTrue(restored.saved)
+
+    def test_unresolved_supervisor_identity_does_not_clear_active_row(self):
+        panel = SettingsPanel()
+        existing = wifi.Network(
+            'Cafe',
+            saved=True,
+            active=True,
+            profile_uuid='uuid-cafe',
+        )
+        panel.networks = [existing]
+        snapshot = wifi.ConnectionStatus(
+            sequence=1,
+            phase='connected',
+            code='connected',
+            message='Connected to another network',
+            ssid='Unknown network',
+            active_uuid='uuid-unknown',
+        )
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=snapshot,
+        ):
+            panel._update_connection_supervisor()
+
+        self.assertTrue(existing.active)
+
+    def test_supervisor_ssid_fallback_rejects_conflicting_known_uuid(self):
+        panel = SettingsPanel()
+        conflicting = wifi.Network(
+            'Holmes Guest',
+            saved=True,
+            active=True,
+            profile_uuid='uuid-old',
+        )
+        panel.networks = [conflicting]
+        connected = wifi.ConnectionStatus(
+            sequence=1,
+            phase='connected',
+            code='connected',
+            message='Connected to Holmes Guest',
+            ssid='Holmes Guest',
+            profile_uuid='uuid-new',
+            active_uuid='uuid-new',
+        )
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=connected,
+        ):
+            panel._update_connection_supervisor()
+
+        self.assertTrue(conflicting.active)
+
+        dropped = wifi.ConnectionStatus(
+            sequence=2,
+            phase='grace',
+            code='reconnecting',
+            message='Connection lost - NetworkManager is reconnecting',
+            ssid='Holmes Guest',
+            profile_uuid='uuid-new',
+        )
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=dropped,
+        ):
+            panel._update_connection_supervisor()
+
+        self.assertTrue(conflicting.active)
+
+    def test_supervisor_drop_refreshes_selected_detail_state(self):
+        panel = SettingsPanel()
+        network = wifi.Network(
+            'Holmes Guest',
+            saved=True,
+            active=True,
+            profile_uuid='uuid-holmes',
+        )
+        panel.networks = [network]
+        panel.selected = network
+        panel.view = 'wifi_detail'
+        panel.detail_info = [
+            ('SSID', network.ssid),
+            ('STATUS', 'Connected'),
+            ('IP', '192.0.2.10'),
+        ]
+        snapshot = wifi.ConnectionStatus(
+            sequence=1,
+            phase='grace',
+            code='reconnecting',
+            message='Connection lost - NetworkManager is reconnecting',
+            ssid=network.ssid,
+            profile_uuid=network.profile_uuid,
+        )
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=snapshot,
+        ):
+            panel._update_connection_supervisor()
+
+        detail = dict(panel.detail_info)
+        self.assertFalse(network.active)
+        self.assertEqual(detail['STATUS'], 'Not connected')
+        self.assertNotIn('IP', detail)
+
+    def test_reconnected_snapshot_refreshes_already_active_detail(self):
+        panel = SettingsPanel()
+        network = wifi.Network(
+            'Holmes Guest',
+            saved=True,
+            active=True,
+            profile_uuid='uuid-holmes',
+        )
+        panel.networks = [network]
+        panel.selected = network
+        panel.view = 'wifi_detail'
+        snapshot = wifi.ConnectionStatus(
+            sequence=1,
+            phase='reconnected',
+            code='reconnected',
+            message='Reconnected to Holmes Guest',
+            ssid=network.ssid,
+            profile_uuid=network.profile_uuid,
+            active_uuid=network.profile_uuid,
+        )
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=snapshot,
+        ), mock.patch.object(
+                panel,
+                '_refresh_detail_info',
+        ) as refresh:
+            panel._update_connection_supervisor()
+
+        self.assertTrue(network.active)
+        refresh.assert_called_once_with(network)
+
+    def test_supervisor_failure_is_retained_when_wifi_view_opens(self):
+        panel = SettingsPanel()
+        snapshot = wifi.ConnectionStatus(
+            sequence=3,
+            phase='attention',
+            code='authentication_failed',
+            message='Authentication failed - password required',
+            profile_uuid='uuid-home',
+            reason_code=7,
+        )
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=snapshot,
+        ):
+            panel._update_connection_supervisor()
+        panel._goto('wifi')
+
+        self.assertEqual(
+            panel.status,
+            'Authentication failed - password required',
+        )
+        self.assertEqual(panel.status_kind, 'error')
+
+    def test_older_supervisor_snapshot_does_not_replace_newer_notice(self):
+        panel = SettingsPanel()
+        panel.view = 'wifi'
+        panel._supervisor_sequence = 4
+        panel.status = 'Reconnected to Home'
+        snapshot = wifi.ConnectionStatus(
+            sequence=3,
+            phase='failed',
+            code='ssid_not_found',
+            message='Saved network is not currently visible',
+        )
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=snapshot,
+        ):
+            panel._update_connection_supervisor()
+
+        self.assertEqual(panel.status, 'Reconnected to Home')
+        self.assertEqual(panel._supervisor_sequence, 4)
+
+    def test_connected_snapshot_clears_visible_supervisor_error(self):
+        panel = SettingsPanel()
+        panel.view = 'wifi'
+        panel._supervisor_sequence = 1
+        panel._supervisor_notice = 'Could not read Wi-Fi state'
+        panel._supervisor_notice_kind = 'error'
+        panel.status = panel._supervisor_notice
+        panel.status_kind = 'error'
+        snapshot = wifi.ConnectionStatus(
+            sequence=2,
+            phase='connected',
+            code='connected',
+            message='Connected to Home',
+            ssid='Home',
+            active_uuid='uuid-home',
+        )
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_snapshot',
+                return_value=snapshot,
+        ):
+            panel._update_connection_supervisor()
+
+        self.assertEqual(panel._supervisor_notice, '')
+        self.assertEqual(panel.status, 'Connected to Home')
+        self.assertEqual(panel.status_kind, 'success')
+
+    def test_selecting_target_preserves_supervisor_failure_notice(self):
+        panel = SettingsPanel()
+        network = wifi.Network(
+            'Holmes Guest',
+            saved=True,
+            profile_uuid='uuid-holmes',
+        )
+        panel._supervisor_notice = 'Authentication failed - password required'
+        panel._supervisor_notice_kind = 'error'
+        panel._supervisor_notice_profile_uuid = 'uuid-holmes'
+        panel._supervisor_notice_ssid = network.ssid
+
+        panel._select(network)
+
+        self.assertEqual(
+            panel.status,
+            'Authentication failed - password required',
+        )
+        self.assertEqual(panel.status_kind, 'error')
+
+    def test_identityless_disconnect_notice_does_not_leak_into_detail(self):
+        panel = SettingsPanel()
+        network = wifi.Network('ASUS_C')
+        panel._supervisor_notice = 'Disconnected from Holmes Guest'
+        panel._supervisor_notice_kind = 'info'
+        panel._supervisor_notice_phase = 'disconnected'
+
+        panel._select(network)
+
+        self.assertEqual(panel.status, '')
+        self.assertEqual(panel.status_kind, 'info')
+
+    def test_successful_scan_keeps_summary_when_backend_message_is_empty(self):
+        panel = SettingsPanel()
+        job = wifi.WifiJob('scan')
+        job.finish(
+            True,
+            '',
+            networks=[
+                wifi.Network('Home'),
+                wifi.Network('Cafe', stale=True),
+            ],
+        )
+        panel.scan_job = job
+
+        panel._update_wifi_jobs()
+
+        self.assertEqual(panel.status, '1 detected, 1 recent')
+        self.assertEqual(panel.scan_summary, '1 detected, 1 recent')
+        self.assertEqual(panel.status_kind, 'info')
+
+    def test_scan_summary_retains_session_completion_time(self):
+        panel = SettingsPanel()
+        job = wifi.WifiJob('scan')
+        job.finish(
+            True,
+            '',
+            networks=[wifi.Network('Home')],
+            completed_at=1234.5,
+        )
+        panel.scan_job = job
+
+        with mock.patch.object(
+                SettingsPanel,
+                '_scan_time_label',
+                return_value='2:34 PM',
+        ):
+            panel._update_wifi_jobs()
+
+        self.assertEqual(panel.last_scan_completed_at, 1234.5)
+        self.assertEqual(panel.scan_summary, '1 detected @ 2:34 PM')
 
     def test_detail_worker_does_not_overwrite_newer_ui_state(self):
         panel = SettingsPanel()
@@ -272,6 +695,138 @@ class WifiUiStateTests(unittest.TestCase):
         self.assertEqual(panel.status, 'Checking saved network...')
         connect.assert_called_once_with(network)
 
+    def test_saved_network_not_detected_has_no_current_signal_state(self):
+        network = types.SimpleNamespace(
+            ssid='Holmes Guest',
+            signal=84,
+            security='WPA2',
+            protected=True,
+            saved=True,
+            active=False,
+            profile_known=True,
+            supported=True,
+            detected=False,
+            stale=False,
+        )
+
+        tag, show_signal = SettingsPanel._network_row_state(network)
+        detail = SettingsPanel._basic_network_info(network)
+
+        self.assertEqual(tag, 'NOT DETECTED')
+        self.assertFalse(show_signal)
+        self.assertNotIn('SIGNAL', [label for label, _value in detail])
+        self.assertIn(
+            ('AVAILABILITY', 'Not detected'),
+            detail,
+        )
+
+    def test_active_saved_only_row_does_not_invent_signal_or_security(self):
+        network = wifi.Network(
+            'Holmes Guest',
+            saved=True,
+            active=True,
+            profile_uuid='uuid-holmes',
+            detected=False,
+        )
+
+        tag, show_signal = SettingsPanel._network_row_state(network)
+        detail = dict(SettingsPanel._basic_network_info(network))
+        summary = SettingsPanel._scan_result_summary([network])
+
+        self.assertEqual(tag, 'ONLINE')
+        self.assertFalse(show_signal)
+        self.assertEqual(detail['AVAILABILITY'], 'Not detected')
+        self.assertEqual(detail['SECURITY'], 'Unknown')
+        self.assertEqual(detail['PROTECTED'], 'Unknown')
+        self.assertEqual(summary, '0 detected')
+
+    def test_active_saved_only_detail_worker_keeps_signal_sanitized(self):
+        panel = SettingsPanel()
+        network = wifi.Network(
+            'Holmes Guest',
+            saved=True,
+            active=True,
+            profile_uuid='uuid-holmes',
+            detected=False,
+        )
+        full_info = [
+            ('SSID', network.ssid),
+            ('SIGNAL', '0%'),
+            ('STATUS', 'Connected'),
+            ('IP', '192.0.2.10'),
+        ]
+
+        with mock.patch.object(wifi, 'info', return_value=full_info), \
+                mock.patch.object(
+                    settings_module.threading,
+                    'Thread',
+                ) as thread_class:
+            panel._select(network)
+            worker = thread_class.call_args.kwargs['target']
+            worker()
+
+        detail = dict(panel.detail_info)
+        self.assertNotIn('SIGNAL', detail)
+        self.assertEqual(detail['AVAILABILITY'], 'Not detected')
+        self.assertEqual(detail['IP'], '192.0.2.10')
+
+    def test_recent_cached_network_is_distinct_and_has_no_current_signal(self):
+        network = wifi.Network('Cafe', signal=72, stale=True)
+
+        tag, show_signal = SettingsPanel._network_row_state(network)
+        detail = SettingsPanel._basic_network_info(network)
+
+        self.assertEqual(tag, 'RECENT')
+        self.assertFalse(show_signal)
+        self.assertNotIn('SIGNAL', [label for label, _value in detail])
+        self.assertIn(('AVAILABILITY', 'Recent result'), detail)
+
+    def test_saved_network_not_detected_cannot_connect_until_rescan(self):
+        panel = SettingsPanel()
+        network = types.SimpleNamespace(
+            ssid='Holmes Guest',
+            signal=0,
+            security='WPA2',
+            protected=True,
+            saved=True,
+            active=False,
+            profile_known=True,
+            supported=True,
+            detected=False,
+            stale=False,
+        )
+        panel.selected = network
+        panel.view = 'wifi_detail'
+
+        with mock.patch.object(wifi, 'connect_async') as connect:
+            panel._do_connect()
+
+        connect.assert_not_called()
+        self.assertIsNone(panel.action_job)
+        self.assertEqual(panel.status, 'Not detected. Press Rescan.')
+        self.assertEqual(panel.status_kind, 'error')
+
+    def test_password_submit_waits_for_supervisor_recovery(self):
+        panel = SettingsPanel()
+        network = wifi.Network('Cafe', security='WPA2')
+        keyboard = FakeKeyboard('Password: Cafe')
+        panel.selected = network
+        panel.keyboard = keyboard
+
+        with mock.patch.object(
+                wifi,
+                'connection_supervisor_recovery_busy',
+                return_value=True,
+        ), mock.patch.object(wifi, 'connect_async') as connect:
+            panel._connect_with_password('correct password')
+
+        connect.assert_not_called()
+        self.assertIs(panel.keyboard, keyboard)
+        self.assertEqual(
+            panel.status,
+            'Wi-Fi recovery in progress. Try again shortly.',
+        )
+
     def test_disconnect_failure_stays_on_detail_and_shows_error(self):
         panel = SettingsPanel()
         network = wifi.Network('Home', active=True)
@@ -289,113 +844,58 @@ class WifiUiStateTests(unittest.TestCase):
         self.assertEqual(panel.status_kind, 'error')
         self.assertIsNone(panel.action_job)
 
-    def test_disconnect_success_returns_to_list_and_refreshes_cached_state(self):
+    def test_disconnect_success_updates_local_state_without_scanning(self):
         panel = SettingsPanel()
-        network = wifi.Network('Home', active=True)
+        network = wifi.Network('Home', saved=True, active=True)
         panel.networks = [network]
         panel.selected = network
         panel.view = 'wifi_detail'
+        panel.scroll = -80
         action = wifi.WifiJob('disconnect', network.ssid)
         action.finish(True, 'Disconnected from Home', code='disconnected')
         panel.action_job = action
-        scan = wifi.WifiJob('scan')
 
-        with mock.patch.object(
-                wifi,
-                'scan_async',
-                return_value=scan,
-        ) as scan_async:
+        with mock.patch.object(wifi, 'scan_async') as scan_async:
             panel._update_wifi_jobs()
 
-        scan_async.assert_called_once_with(rescan=False)
+        scan_async.assert_not_called()
         self.assertEqual(panel.view, 'wifi')
         self.assertIsNone(panel.selected)
-        self.assertIs(panel.scan_job, scan)
-        self.assertEqual(panel._after_scan_message, 'Disconnected from Home')
-        self.assertEqual(panel.status, 'Refreshing...')
+        self.assertIsNone(panel.scan_job)
+        self.assertEqual(panel.status, 'Disconnected from Home')
+        self.assertEqual(panel.status_kind, 'success')
+        self.assertEqual(panel.scroll, -80)
         self.assertFalse(network.active)
+        self.assertTrue(network.saved)
 
-        scan.finish(
-            True,
-            'Showing recent results',
-            code='partial',
-            networks=[wifi.Network('Home', stale=True)],
-            partial=True,
-        )
-        panel._update_wifi_jobs()
-        self.assertEqual(
-            panel.status,
-            'Disconnected from Home - Showing recent results',
-        )
-
-    def test_connect_success_returns_to_list_without_hardware_rescan(self):
+    def test_connect_success_updates_local_state_without_scanning(self):
         panel = SettingsPanel()
         network = wifi.Network('Home', saved=True)
-        panel.networks = [network]
+        previous = wifi.Network('Cafe', saved=True, active=True)
+        panel.networks = [previous, network]
         panel.selected = network
         panel.view = 'wifi_detail'
+        panel.scroll = -40
         action = wifi.WifiJob('connect', network.ssid)
         action.finish(True, 'Connected to Home', code='connected')
         panel.action_job = action
-        scan = wifi.WifiJob('scan')
 
-        with mock.patch.object(
-                wifi,
-                'scan_async',
-                return_value=scan,
-        ) as scan_async:
+        with mock.patch.object(wifi, 'scan_async') as scan_async:
             panel._update_wifi_jobs()
 
-        scan_async.assert_called_once_with(rescan=False)
+        scan_async.assert_not_called()
         self.assertEqual(panel.view, 'wifi')
         self.assertIsNone(panel.selected)
-        self.assertEqual(panel._after_scan_message, 'Connected to Home')
-        self.assertEqual(panel.status, 'Refreshing...')
+        self.assertEqual(panel.status, 'Connected to Home')
+        self.assertEqual(panel.status_kind, 'success')
+        self.assertEqual(panel.scroll, -40)
+        self.assertTrue(network.active)
+        self.assertTrue(network.saved)
+        self.assertFalse(previous.active)
 
-    def test_failed_follow_up_scan_keeps_disconnect_confirmation(self):
-        panel = SettingsPanel()
-        network = wifi.Network('Home', active=True)
-        panel.networks = [network]
-        panel.selected = network
-        panel.view = 'wifi_detail'
-        action = wifi.WifiJob('disconnect', network.ssid)
-        action.finish(True, 'Disconnected from Home', code='disconnected')
-        panel.action_job = action
-        scan = wifi.WifiJob('scan')
-
-        with mock.patch.object(wifi, 'scan_async', return_value=scan):
-            panel._update_wifi_jobs()
-
-        scan.finish(False, 'Scan failed', code='scan_failed', networks=[])
+        # Polling again must not clear the retained confirmation.
         panel._update_wifi_jobs()
-
-        self.assertEqual(panel.networks, [network])
-        self.assertFalse(network.active)
-        self.assertEqual(
-            panel.status,
-            'Disconnected from Home - Scan failed',
-        )
-        self.assertEqual(panel.status_kind, 'error')
-
-    def test_empty_follow_up_scan_keeps_disconnect_confirmation(self):
-        panel = SettingsPanel()
-        network = wifi.Network('Home', active=True)
-        panel.networks = [network]
-        panel.selected = network
-        panel.view = 'wifi_detail'
-        action = wifi.WifiJob('disconnect', network.ssid)
-        action.finish(True, 'Disconnected from Home', code='disconnected')
-        panel.action_job = action
-        scan = wifi.WifiJob('scan')
-
-        with mock.patch.object(wifi, 'scan_async', return_value=scan):
-            panel._update_wifi_jobs()
-
-        scan.finish(True, '', networks=[])
-        panel._update_wifi_jobs()
-
-        self.assertEqual(panel.networks, [])
-        self.assertEqual(panel.status, 'Disconnected from Home')
+        self.assertEqual(panel.status, 'Connected to Home')
         self.assertEqual(panel.status_kind, 'success')
 
     def test_saved_authentication_failure_reopens_password_keyboard(self):
@@ -425,20 +925,176 @@ class WifiUiStateTests(unittest.TestCase):
         self.assertEqual(panel.status, 'Wrong password')
         self.assertEqual(panel.status_kind, 'error')
 
-    def test_failed_scan_preserves_existing_network_list(self):
+    def test_empty_failed_scan_expires_previous_detected_rows(self):
         panel = SettingsPanel()
-        existing = wifi.Network('Home', active=True)
+        existing = wifi.Network('Old network', signal=91)
         panel.networks = [existing]
         job = wifi.WifiJob('scan')
-        job.finish(False, 'Scan failed', code='scan_failed', networks=[])
+        job.finish(
+            False,
+            'Scan failed',
+            code='scan_failed',
+            networks=[],
+            completed_at=1234.5,
+        )
+        panel.scan_job = job
+
+        with mock.patch.object(
+                SettingsPanel,
+                '_scan_time_label',
+                return_value='2:34 PM',
+        ):
+            panel._update_wifi_jobs()
+
+        self.assertEqual(panel.networks, [])
+        self.assertEqual(
+            panel.status,
+            '0 detected @ 2:34 PM; Scan failed',
+        )
+        self.assertEqual(panel.status_kind, 'error')
+        self.assertEqual(panel.scan_summary_kind, 'error')
+        self.assertIsNone(panel.scan_job)
+
+        panel.view = 'wifi_detail'
+        panel._goto('wifi')
+        self.assertEqual(
+            panel.status,
+            '0 detected @ 2:34 PM; Scan failed',
+        )
+        self.assertEqual(panel.status_kind, 'error')
+
+    def test_empty_failed_scan_safely_retains_saved_and_active_rows(self):
+        panel = SettingsPanel()
+        saved = wifi.Network(
+            'Holmes Guest',
+            signal=84,
+            security='WPA2',
+            saved=True,
+            bssid='00:11:22:33:44:55',
+            iface='wlan0',
+            profile_name='holmes-profile',
+            profile_uuid='uuid-holmes',
+            last_seen=100.0,
+            in_use=False,
+        )
+        active = wifi.Network(
+            'ASUS_C',
+            signal=72,
+            security='WPA2',
+            saved=True,
+            active=True,
+            bssid='00:11:22:33:44:66',
+            iface='wlan0',
+            profile_name='asus-profile',
+            profile_uuid='uuid-asus',
+            last_seen=100.0,
+            in_use=True,
+        )
+        expired = wifi.Network('Neighbor', signal=90)
+        panel.networks = [saved, active, expired]
+        job = wifi.WifiJob('scan')
+        job.finish(
+            False,
+            'Scan failed',
+            code='scan_failed',
+            networks=[],
+            completed_at=1234.5,
+        )
+        panel.scan_job = job
+
+        with mock.patch.object(
+                SettingsPanel,
+                '_scan_time_label',
+                return_value='',
+        ):
+            panel._update_wifi_jobs()
+
+        self.assertEqual(panel.networks, [saved, active])
+        self.assertEqual(saved.profile_uuid, 'uuid-holmes')
+        self.assertEqual(saved.profile_name, 'holmes-profile')
+        self.assertEqual(active.profile_uuid, 'uuid-asus')
+        self.assertTrue(active.active)
+        for network in panel.networks:
+            self.assertFalse(network.detected)
+            self.assertFalse(network.stale)
+            self.assertEqual(network.signal, 0)
+            self.assertEqual(network.security, '')
+            self.assertFalse(network.protected)
+            self.assertEqual(network.bssid, '')
+            self.assertEqual(network.last_seen, 0.0)
+            self.assertFalse(network.in_use)
+        self.assertEqual(
+            panel.status,
+            '0 detected, 1 saved not detected; Scan failed',
+        )
+
+    def test_preflight_scan_failure_preserves_list_and_scroll_unchanged(self):
+        panel = SettingsPanel()
+        saved = wifi.Network(
+            'Holmes Guest',
+            signal=84,
+            security='WPA2',
+            saved=True,
+            profile_uuid='uuid-holmes',
+        )
+        nearby = wifi.Network('Neighbor', signal=71)
+        original = [saved, nearby]
+        panel.networks = original
+        panel.scroll = -40
+        job = wifi.WifiJob('scan')
+        job.finish(
+            False,
+            'Wi-Fi is busy',
+            code='busy',
+            networks=[],
+            completed_at=0.0,
+        )
         panel.scan_job = job
 
         panel._update_wifi_jobs()
 
-        self.assertEqual(panel.networks, [existing])
-        self.assertEqual(panel.status, 'Scan failed')
-        self.assertEqual(panel.status_kind, 'error')
-        self.assertIsNone(panel.scan_job)
+        self.assertIs(panel.networks, original)
+        self.assertEqual(panel.networks, [saved, nearby])
+        self.assertEqual(panel.scroll, -40)
+        self.assertTrue(saved.detected)
+        self.assertEqual(saved.signal, 84)
+        self.assertEqual(saved.security, 'WPA2')
+        self.assertTrue(nearby.detected)
+        self.assertEqual(nearby.signal, 71)
+        self.assertEqual(panel.status, '2 detected; Wi-Fi is busy')
+        self.assertFalse(panel._show_empty_scan_result())
+
+    def test_zero_time_unexpected_scan_failure_expires_detected_rows(self):
+        panel = SettingsPanel()
+        saved = wifi.Network(
+            'Holmes Guest',
+            signal=84,
+            security='WPA2',
+            saved=True,
+            profile_uuid='uuid-holmes',
+        )
+        expired = wifi.Network('Neighbor', signal=71)
+        panel.networks = [saved, expired]
+        job = wifi.WifiJob('scan')
+        job.finish(
+            False,
+            'Scan failed',
+            code='unexpected',
+            networks=[],
+            completed_at=0.0,
+        )
+        panel.scan_job = job
+
+        panel._update_wifi_jobs()
+
+        self.assertEqual(panel.networks, [saved])
+        self.assertFalse(saved.detected)
+        self.assertEqual(saved.signal, 0)
+        self.assertEqual(saved.security, '')
+        self.assertEqual(
+            panel.status,
+            '0 detected, 1 saved not detected; Scan failed',
+        )
 
     def test_partial_scan_updates_list_and_shows_recent_status(self):
         panel = SettingsPanel()
@@ -456,7 +1112,10 @@ class WifiUiStateTests(unittest.TestCase):
         panel._update_wifi_jobs()
 
         self.assertEqual(panel.networks, [recent])
-        self.assertEqual(panel.status, 'Showing recent results')
+        self.assertEqual(
+            panel.status,
+            '0 detected, 1 recent; Showing recent results',
+        )
         self.assertEqual(panel.status_kind, 'info')
 
     def test_scroll_buttons_move_one_row_and_clamp_at_each_end(self):
