@@ -1,0 +1,15 @@
+// Allow only the BART display systemd service to request a normal reboot.
+// Keep power-off, suspend, ignore-inhibit, and arbitrary systemd operations
+// outside the service's authorization boundary.
+polkit.addRule(function(action, subject) {
+  var allowed = [
+    "org.freedesktop.login1.reboot",
+    "org.freedesktop.login1.reboot-multiple-sessions"
+  ];
+
+  if (subject.user == "kevinchan" &&
+      subject.system_unit == "bart-platform-display.service" &&
+      allowed.indexOf(action.id) >= 0) {
+    return polkit.Result.YES;
+  }
+});

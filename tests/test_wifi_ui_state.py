@@ -97,6 +97,188 @@ class WifiUiStateTests(unittest.TestCase):
 
         self.assertEqual(panel.state, 'OPEN')
 
+    def test_service_restart_requires_confirmation_and_feedback_delay(self):
+        panel = SettingsPanel()
+
+        panel._begin_system_confirmation('service')
+
+        self.assertEqual(panel.system_state, 'confirming')
+        self.assertEqual(panel.system_confirm_target, 'service')
+        self.assertFalse(panel.request_service_restart)
+
+        panel._confirm_system_action()
+
+        self.assertEqual(panel.system_state, 'dispatching')
+        self.assertEqual(panel.system_active_target, 'service')
+        self.assertFalse(panel.request_service_restart)
+        panel._update_system_action(10_000)
+        self.assertTrue(panel.system_feedback_rendered)
+        self.assertFalse(panel.request_service_restart)
+        panel._update_system_action(settings_module._SYSTEM_FEEDBACK_MS - 1)
+        self.assertFalse(panel.request_service_restart)
+        panel._update_system_action(1)
+        self.assertTrue(panel.request_service_restart)
+
+    def test_system_confirmation_can_be_cancelled(self):
+        panel = SettingsPanel()
+        panel._begin_system_confirmation('device')
+
+        panel._cancel_system_confirmation()
+
+        self.assertEqual(panel.system_state, 'idle')
+        self.assertEqual(panel.system_confirm_target, '')
+        self.assertFalse(panel.request_service_restart)
+        self.assertIsNone(panel.system_job)
+
+    def test_device_restart_dispatches_once_after_feedback_delay(self):
+        panel = SettingsPanel()
+        job = types.SimpleNamespace(
+            status='Requesting Raspberry Pi restart...',
+            message='',
+            done=False,
+            ok=False,
+        )
+        panel._begin_system_confirmation('device')
+        panel._confirm_system_action()
+
+        with mock.patch.object(
+                settings_module.system_control,
+                'reboot_async',
+                return_value=job) as reboot:
+            panel._update_system_action(10_000)
+            reboot.assert_not_called()
+            panel._update_system_action(settings_module._SYSTEM_FEEDBACK_MS)
+            panel._update_system_action(16)
+
+        reboot.assert_called_once_with()
+        self.assertIs(panel.system_job, job)
+        self.assertEqual(panel.system_active_target, 'device')
+        self.assertEqual(
+            panel.system_status,
+            'Requesting Raspberry Pi restart...',
+        )
+
+    def test_device_restart_failure_restores_usable_system_view(self):
+        panel = SettingsPanel()
+        panel.system_state = 'dispatching'
+        panel.system_active_target = 'device'
+        panel.system_job = types.SimpleNamespace(
+            status='Device restart is not authorized',
+            message='Device restart is not authorized',
+            done=True,
+            ok=False,
+        )
+
+        panel._update_system_action(16)
+
+        self.assertEqual(panel.system_state, 'failed')
+        self.assertFalse(panel._system_busy())
+        self.assertEqual(panel.system_active_target, '')
+        self.assertIsNone(panel.system_job)
+        self.assertEqual(panel.system_status_kind, 'error')
+        self.assertEqual(
+            panel.system_status,
+            'Device restart is not authorized',
+        )
+
+    def test_accepted_device_restart_stays_locked_for_shutdown(self):
+        panel = SettingsPanel()
+        panel.system_state = 'dispatching'
+        panel.system_active_target = 'device'
+        panel.system_job = types.SimpleNamespace(
+            status='Restart accepted. Waiting for Raspberry Pi...',
+            message='Restart accepted. Waiting for Raspberry Pi...',
+            done=True,
+            ok=True,
+        )
+
+        panel._update_system_action(16)
+
+        self.assertEqual(panel.system_state, 'dispatching')
+        self.assertTrue(panel._system_busy())
+        self.assertEqual(panel.system_active_target, 'device')
+        self.assertIsNone(panel.system_job)
+        self.assertEqual(panel.system_status_kind, 'success')
+
+    def test_duplicate_system_action_is_ignored_while_dispatching(self):
+        panel = SettingsPanel()
+        panel._begin_system_confirmation('service')
+        panel._confirm_system_action()
+        delay = panel.system_dispatch_delay_ms
+
+        panel._begin_system_confirmation('device')
+        panel._confirm_system_action()
+
+        self.assertEqual(panel.system_state, 'dispatching')
+        self.assertEqual(panel.system_active_target, 'service')
+        self.assertEqual(panel.system_dispatch_target, 'service')
+        self.assertEqual(panel.system_dispatch_delay_ms, delay)
+
+    def test_upward_swipe_cannot_close_during_system_action(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.system_state = 'dispatching'
+        panel.system_active_target = 'device'
+
+        panel.handle({
+            'kind': 'release',
+            'swipe': 'up',
+            'start_y': 200,
+        })
+
+        self.assertEqual(panel.state, 'OPEN')
+
+    def test_system_view_renders_two_distinct_restart_buttons(self):
+        panel = SettingsPanel()
+        buttons = []
+
+        class RecordingButton:
+            def __init__(self, rect, label, **kwargs):
+                self.rect = rect
+                self.label = label
+                buttons.append(self)
+
+            def draw(self):
+                pass
+
+        with (
+                mock.patch.object(
+                    settings_module,
+                    'Button',
+                    RecordingButton,
+                ),
+                mock.patch.object(
+                    panel,
+                    '_header',
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    settings_module.display,
+                    'blit_center',
+                    return_value=None,
+                    create=True,
+                ),
+                mock.patch.object(
+                    settings_module.display,
+                    'font_xs',
+                    object(),
+                    create=True,
+                )):
+            panel._render_system()
+
+        self.assertEqual(
+            [button.label for button in buttons],
+            [
+                'RESTART DISPLAY SERVICE',
+                'RESTART RASPBERRY PI',
+            ],
+        )
+        service_rect, device_rect = [button.rect for button in buttons]
+        self.assertLess(
+            service_rect[1] + service_rect[3],
+            device_rect[1],
+        )
+
     def test_scrollbar_drag_release_does_not_close_panel(self):
         panel = SettingsPanel()
         panel.state = 'OPEN'

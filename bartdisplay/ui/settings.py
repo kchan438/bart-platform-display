@@ -14,7 +14,7 @@ import time
 
 import pygame
 
-from .. import config, display, wifi
+from .. import config, display, system_control, wifi
 from ..display import C, W, H, PAD
 from .keyboard import Keyboard
 from .widgets import Button, draw_signal_bars, draw_lock, draw_tag
@@ -33,15 +33,16 @@ _SCROLL_THUMB_MIN_H = 32
 _LIST_RIGHT = W - _SCROLLBAR_W
 _DETAIL_ACTION_TOP = H - 40
 _STATUS_ACTION_GAP = 4
+_SYSTEM_FEEDBACK_MS = 350
 
 
 class SettingsPanel:
     def __init__(self):
         self.state = 'CLOSED'          # CLOSED | OPENING | OPEN | CLOSING
         self.y_off = -H                # -H (hidden) .. 0 (fully open)
-        self.view = 'menu'             # menu | wifi | wifi_detail | apikey
+        self.view = 'menu'             # menu | wifi | wifi_detail | apikey | system
         self.keyboard = None
-        self.request_exit = False      # main loop watches this for RESTART
+        self.request_service_restart = False
 
         self.networks = []
         self.selected = None           # Network in detail view
@@ -65,6 +66,15 @@ class SettingsPanel:
         self._scrollbar_drag_offset = 0
 
         self.api_saved = False
+        self.system_state = 'idle'     # idle | confirming | dispatching | failed
+        self.system_confirm_target = ''
+        self.system_active_target = ''
+        self.system_dispatch_target = ''
+        self.system_dispatch_delay_ms = 0
+        self.system_feedback_rendered = False
+        self.system_job = None
+        self.system_status = ''
+        self.system_status_kind = 'info'
         self._buttons = []
         self._surf = pygame.Surface((W, H))
 
@@ -79,6 +89,8 @@ class SettingsPanel:
             self.status = ''
 
     def close(self):
+        if self._system_busy():
+            return
         if self.state in ('OPEN', 'OPENING'):
             self.state = 'CLOSING'
             self.keyboard = None
@@ -104,6 +116,96 @@ class SettingsPanel:
             )
         if view == 'apikey':
             self.api_saved = False
+        if view == 'system' and not self._system_busy():
+            self.system_state = 'idle'
+            self.system_confirm_target = ''
+            self.system_active_target = ''
+            self.system_dispatch_target = ''
+            self.system_dispatch_delay_ms = 0
+            self.system_feedback_rendered = False
+            self.system_job = None
+            self.system_status = ''
+            self.system_status_kind = 'info'
+
+    # -- System operations --------------------------------------------------
+    def _system_busy(self):
+        return self.system_state == 'dispatching'
+
+    def _begin_system_confirmation(self, target):
+        if target not in ('service', 'device') or self._system_busy():
+            return
+        self.system_state = 'confirming'
+        self.system_confirm_target = target
+        self.system_active_target = ''
+        self.system_status = ''
+        self.system_status_kind = 'info'
+
+    def _cancel_system_confirmation(self):
+        if self.system_state != 'confirming':
+            return
+        self.system_state = 'idle'
+        self.system_confirm_target = ''
+
+    def _confirm_system_action(self):
+        if self.system_state != 'confirming':
+            return
+        target = self.system_confirm_target
+        if target not in ('service', 'device'):
+            return
+        self.system_state = 'dispatching'
+        self.system_confirm_target = ''
+        self.system_active_target = target
+        self.system_dispatch_target = target
+        self.system_dispatch_delay_ms = _SYSTEM_FEEDBACK_MS
+        self.system_feedback_rendered = False
+        self.system_status = (
+            'Restarting display service...'
+            if target == 'service'
+            else 'Restarting Raspberry Pi...'
+        )
+        self.system_status_kind = 'info'
+
+    def _update_system_action(self, dt_ms):
+        if self.system_state != 'dispatching':
+            return
+
+        if self.system_dispatch_target:
+            # The confirmation handler runs before update/render in main.py.
+            # Always allow one complete frame to show the terminal feedback,
+            # even if this frame's dt is larger than the nominal delay.
+            if not self.system_feedback_rendered:
+                self.system_feedback_rendered = True
+                return
+            self.system_dispatch_delay_ms -= dt_ms
+            if self.system_dispatch_delay_ms > 0:
+                return
+            target = self.system_dispatch_target
+            self.system_dispatch_target = ''
+            if target == 'service':
+                self.request_service_restart = True
+                return
+            self.system_job = system_control.reboot_async()
+
+        if self.system_job is None:
+            return
+
+        job = self.system_job
+        self.system_status = job.status
+        self.system_status_kind = 'info'
+        if not job.done:
+            return
+
+        self.system_job = None
+        self.system_status = job.message
+        if job.ok:
+            # Keep the UI locked after logind accepts the request. The process
+            # should be terminated by the ensuing reboot.
+            self.system_status_kind = 'success'
+            return
+
+        self.system_state = 'failed'
+        self.system_active_target = ''
+        self.system_status_kind = 'error'
 
     # -- Wi-Fi operations ---------------------------------------------------
     def _wifi_busy(self):
@@ -533,6 +635,7 @@ class SettingsPanel:
                 self.y_off = -H
                 self.state = 'CLOSED'
 
+        self._update_system_action(dt_ms)
         self._update_wifi_jobs()
         self._update_connection_supervisor()
 
@@ -552,6 +655,8 @@ class SettingsPanel:
         # Swipe up returns to the board from every panel view. Finishing a
         # scrollbar-thumb drag must not also dismiss the panel.
         if kind == 'release' and event.get('swipe') == 'up':
+            if self._system_busy():
+                return
             if self._scrollbar_dragging:
                 self._scrollbar_dragging = False
                 return
@@ -711,9 +816,13 @@ class SettingsPanel:
         display.blit_center(title, display.font_sm, C['on'], W // 2, 8)
         btns = []
         if back_to is not None:
+            blocked = (
+                (back_to == 'wifi' and self._wifi_busy())
+                or (self.view == 'system' and self._system_busy())
+            )
             b = Button((PAD, 5, 82, 26), 'BACK',
                        on_tap=lambda _b: self._goto(back_to), font=display.font_xs,
-                       enabled=not (back_to == 'wifi' and self._wifi_busy()))
+                       enabled=not blocked)
             b.draw()
             btns.append(b)
         display.divider(_HEADER_H, color=C['dim'])
@@ -728,6 +837,8 @@ class SettingsPanel:
             self._render_wifi_detail()
         elif self.view == 'apikey':
             self._render_apikey()
+        elif self.view == 'system':
+            self._render_system()
 
     # -- menu ---------------------------------------------------------------
     def _render_menu(self):
@@ -736,23 +847,27 @@ class SettingsPanel:
         # grab-handle affordance
         pygame.draw.rect(self._surf, C['dim'], (W // 2 - 20, 6, 40, 4))
 
-        wifi_btn = Button((PAD, 62, W - 2 * PAD, 50), 'WI-FI',
+        wifi_btn = Button((PAD, 48, W - 2 * PAD, 50), 'WI-FI',
                           on_tap=lambda _b: self._goto('wifi'), font=display.font_sm)
-        api_btn = Button((PAD, 120, W - 2 * PAD, 50), 'BART API KEY',
+        api_btn = Button((PAD, 104, W - 2 * PAD, 50), 'BART API KEY',
                          on_tap=lambda _b: self._goto('apikey'), font=display.font_sm)
+        system_btn = Button((PAD, 160, W - 2 * PAD, 50), 'SYSTEM',
+                            on_tap=lambda _b: self._goto('system'),
+                            font=display.font_sm)
         wifi_btn.draw()
         api_btn.draw()
+        system_btn.draw()
 
         cursor_on = config.get_show_touch_cursor()
         cursor_btn = Button(
-            (PAD, 178, W - 2 * PAD, 40),
+            (PAD, 218, W - 2 * PAD, 40),
             'TOUCH CURSOR: ' + ('ON' if cursor_on else 'OFF'),
             on_tap=lambda _b: self._toggle_cursor(), font=display.font_xs,
             fg=(C['arrive'] if cursor_on else C['dim']))
         cursor_btn.draw()
 
         display.blit_center('Swipe up to close', display.font_xs, C['ghost'], W // 2, H - 24)
-        self._buttons = [wifi_btn, api_btn, cursor_btn]
+        self._buttons = [wifi_btn, api_btn, system_btn, cursor_btn]
 
     def _toggle_cursor(self):
         config.set_show_touch_cursor(not config.get_show_touch_cursor())
@@ -1087,7 +1202,7 @@ class SettingsPanel:
         if self.api_saved:
             display.blit_left('Saved. Applies next poll.',
                               display.font_xs, C['ok'], PAD, y)
-            display.blit_left('Restart to apply now.',
+            display.blit_left('Open System to restart.',
                               display.font_xs, C['dim'], PAD, y + 20)
         y += 24
 
@@ -1097,9 +1212,13 @@ class SettingsPanel:
         btns.append(modify)
 
         if self.api_saved:
-            restart = Button((PAD, H - 40, W - 2 * PAD, 30), 'RESTART APP',
-                             on_tap=lambda _b: self._request_restart(),
-                             font=display.font_xs, fg=C['arrive'])
+            restart = Button(
+                (PAD, H - 40, W - 2 * PAD, 30),
+                'OPEN SYSTEM RESTART',
+                on_tap=lambda _b: self._goto('system'),
+                font=display.font_xs,
+                fg=C['arrive'],
+            )
             restart.draw()
             btns.append(restart)
         self._buttons = btns
@@ -1113,8 +1232,150 @@ class SettingsPanel:
         self.keyboard = None
         self.api_saved = True
 
-    def _request_restart(self):
-        self.request_exit = True
+    # -- System -------------------------------------------------------------
+    def _render_system(self):
+        btns = self._header('SYSTEM', back_to='menu')
+        if self.system_state in ('confirming', 'dispatching'):
+            self._render_system_confirmation(btns)
+            return
+
+        service = Button(
+            (PAD, 52, W - 2 * PAD, 50),
+            'RESTART DISPLAY SERVICE',
+            on_tap=lambda _b: self._begin_system_confirmation('service'),
+            font=display.font_xs,
+            fg=C['arrive'],
+        )
+        service.draw()
+        display.blit_center(
+            'Restarts display only.',
+            display.font_xs,
+            C['dim'],
+            W // 2,
+            112,
+        )
+        display.blit_center(
+            'Raspberry Pi stays on.',
+            display.font_xs,
+            C['ghost'],
+            W // 2,
+            134,
+        )
+
+        device = Button(
+            (PAD, 160, W - 2 * PAD, 50),
+            'RESTART RASPBERRY PI',
+            on_tap=lambda _b: self._begin_system_confirmation('device'),
+            font=display.font_xs,
+            fg=C['err'],
+        )
+        device.draw()
+        display.blit_center(
+            'Reboots the entire device.',
+            display.font_xs,
+            C['dim'],
+            W // 2,
+            220,
+        )
+        display.blit_center(
+            'Display unavailable.',
+            display.font_xs,
+            C['ghost'],
+            W // 2,
+            242,
+        )
+
+        if self.system_status:
+            color = (
+                C['err']
+                if self.system_status_kind == 'error'
+                else C['ok']
+                if self.system_status_kind == 'success'
+                else C['dim']
+            )
+            self._draw_status(
+                self.system_status,
+                color,
+                274,
+                W - 2 * PAD,
+            )
+        self._buttons = btns + [service, device]
+
+    def _render_system_confirmation(self, btns):
+        target = (
+            self.system_confirm_target
+            or self.system_active_target
+        )
+        is_device = target == 'device'
+        title = (
+            'RESTART RASPBERRY PI?'
+            if is_device
+            else 'RESTART SERVICE?'
+        )
+        display.blit_center(title, display.font_sm, C['white'], W // 2, 66)
+
+        if is_device:
+            lines = (
+                'Reboots the whole device.',
+                'Wi-Fi and display stop.',
+                'Until Pi starts again.',
+            )
+        else:
+            lines = (
+                'Restarts display service.',
+                'Raspberry Pi stays on.',
+            )
+        for index, line in enumerate(lines):
+            display.blit_center(
+                line,
+                display.font_xs,
+                C['dim'],
+                W // 2,
+                112 + index * 24,
+            )
+
+        if self.system_state == 'dispatching':
+            color = (
+                C['ok']
+                if self.system_status_kind == 'success'
+                else C['err']
+                if self.system_status_kind == 'error'
+                else C['arrive']
+            )
+            self._draw_status(
+                self.system_status,
+                color,
+                202,
+                W - 2 * PAD,
+            )
+            display.blit_center(
+                'Please wait',
+                display.font_xs,
+                C['ghost'],
+                W // 2,
+                260,
+            )
+            self._buttons = btns
+            return
+
+        cancel = Button(
+            (PAD, H - 102, W - 2 * PAD, 38),
+            'CANCEL',
+            on_tap=lambda _b: self._cancel_system_confirmation(),
+            font=display.font_xs,
+        )
+        confirm = Button(
+            (PAD, H - 56, W - 2 * PAD, 44),
+            'RESTART RASPBERRY PI'
+            if is_device
+            else 'RESTART DISPLAY SERVICE',
+            on_tap=lambda _b: self._confirm_system_action(),
+            font=display.font_xs,
+            fg=C['err'] if is_device else C['arrive'],
+        )
+        cancel.draw()
+        confirm.draw()
+        self._buttons = btns + [cancel, confirm]
 
     # -- keyboard helper ----------------------------------------------------
     def _open_keyboard(self, title, initial, password, on_submit):
