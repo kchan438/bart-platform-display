@@ -71,8 +71,8 @@ def get_touch_calibration():
 
 def get_touch_tuning():
     """Optional dict tuning tap/swipe sensitivity:
-    {tap_max_move, tap_max_time, flick_min_dist}. Larger tap_max_move = more
-    forgiving finger taps."""
+    {tap_max_move, tap_max_time, flick_min_dist, panel_open_start_max_y}.
+    Larger tap_max_move = more forgiving finger taps."""
     return _get('touch_tuning')
 
 

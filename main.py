@@ -10,7 +10,12 @@ import sys
 import pygame
 
 from bartdisplay import board, config, departures, display
-from bartdisplay.touch import RawEvent, GestureRecognizer, TouchReader, TOP_EDGE
+from bartdisplay.touch import (
+    GestureRecognizer,
+    RawEvent,
+    TouchReader,
+    should_open_panel,
+)
 from bartdisplay.ui.settings import SettingsPanel
 
 FPS_IDLE = 10   # board-only: spare the Pi Zero W's CPU
@@ -90,8 +95,7 @@ def main():
             for sem in gestures.feed(raw):
                 if panel.is_active():
                     panel.handle(sem)
-                elif sem.get('kind') == 'release' and sem.get('swipe') == 'down' \
-                        and sem.get('start_y', 999) < TOP_EDGE:
+                elif should_open_panel(sem):
                     panel.open()
 
         panel.update(dt)
