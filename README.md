@@ -25,12 +25,13 @@ bart-platform-display/
 │   ├── board.py                    # main departure-board render
 │   ├── touch.py                    # XPT2046 evdev reader + gesture recognizer
 │   ├── wifi.py                     # nmcli wrapper (scan/connect/disconnect/info)
+│   ├── system_control.py           # async systemd-logind D-Bus reboot request
 │   └── ui/                         # swipe-down settings panel
 │       ├── widgets.py              # buttons + icon helpers
 │       ├── keyboard.py             # on-screen keyboard
-│       └── settings.py            # Wi-Fi + API-key panel
+│       └── settings.py            # Wi-Fi, API-key, and System panel
 ├── deploy/
-│   └── polkit/                    # minimal NetworkManager authorization
+│   └── polkit/                    # minimal NetworkManager/reboot authorization
 ├── docs/product/                  # implementation-ready product requirements
 ├── tests/                         # Wi-Fi lifecycle regression tests
 ├── config.json                     # station, platform, API key
@@ -67,8 +68,13 @@ The device is configured entirely from the touchscreen — no SSH needed:
   retries a user disconnect or authentication failure.
 - **BART API Key**: shows the current key; **Modify** edits it with the keyboard
   and **Save** writes it to `config.json`. A new key applies on the next poll
-  (~30 s) without a restart; a **Restart App** button is offered to apply it
-  immediately.
+  (~30 s) without a restart. After saving, **Open System Restart** links to the
+  shared service restart control when an immediate reload is wanted.
+- **System**: offers two deliberately separate, confirmation-protected actions:
+  **Restart Display Service** cleanly exits only this app so systemd relaunches
+  it, while **Restart Raspberry Pi** requests a normal full-device reboot.
+  Duplicate taps are disabled once an action is dispatched, and immediate
+  authorization or command failures remain visible on screen.
 
 ### Wi-Fi permissions (NetworkManager)
 
@@ -96,6 +102,62 @@ To roll the permission change back:
 
 ```bash
 sudo rm /etc/polkit-1/rules.d/50-bart-platform-display-networkmanager.rules
+sudo systemctl restart polkit
+```
+
+### System restart permissions (systemd-logind)
+
+Restarting only the display service does not need elevated permission. The app
+exits cleanly and the existing `Restart=always` systemd policy relaunches it
+after five seconds.
+
+A full Raspberry Pi reboot calls systemd-logind's `Reboot(false)` method over
+the system D-Bus using `busctl`. The `false` argument disables interactive
+authentication, which is unavailable to the headless service. Install the
+separate reboot-only PolicyKit rule:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  deploy/polkit/51-bart-platform-display-reboot.rules \
+  /etc/polkit-1/rules.d/
+sudo systemctl restart polkit
+```
+
+The rule authorizes only the normal and multiple-session logind reboot actions,
+and only when the request comes from the `kevinchan` process running in
+`bart-platform-display.service`. It does not grant power-off, suspend,
+ignore-inhibit, arbitrary service management, a root shell, or general `sudo`.
+
+Confirm the running service is the authorization subject:
+
+```bash
+SERVICE_PID="$(systemctl show --property MainPID --value bart-platform-display)"
+sudo pkcheck \
+  --action-id org.freedesktop.login1.reboot \
+  --process "$SERVICE_PID"
+```
+
+An exit status of `0` means the service process is authorized. Because the rule
+is intentionally scoped to the systemd unit, calling the same logind method
+from an ordinary SSH shell as `kevinchan` is not expected to receive this grant.
+
+For end-to-end device validation, record both values before testing:
+
+```bash
+cat /proc/sys/kernel/random/boot_id
+systemctl show --property MainPID --value bart-platform-display
+```
+
+After **Restart Display Service**, the main PID must change while the boot ID
+stays the same. After **Restart Raspberry Pi**, reconnect over SSH and confirm
+the boot ID changed and `systemctl is-active bart-platform-display` reports
+`active`. Repeat the device reboot once while another SSH session is open to
+exercise the multiple-session authorization.
+
+To roll the reboot permission back:
+
+```bash
+sudo rm /etc/polkit-1/rules.d/51-bart-platform-display-reboot.rules
 sudo systemctl restart polkit
 ```
 
@@ -225,7 +287,8 @@ The TFT should show the departure board. Press `Ctrl+C` to exit.
 Set `BART_DEV=1` to run in a normal window instead of the framebuffer, with the
 mouse standing in for touch (click = tap, click-drag = swipe/scroll). Wi-Fi and
 touch hardware are mocked, so the settings panel UI can be built and tested off
-the Pi:
+the Pi. Full-device restart is disabled in this mode so exercising the System
+view cannot reboot the development computer:
 
 ```bash
 BART_DEV=1 python main.py
@@ -281,7 +344,8 @@ Edit `config.json` to change the station or other settings:
 | `api_key`          | Your BART API key                                |
 | `refresh_interval` | Seconds between API polls (default `30`)         |
 
-After editing, restart the service:
+After editing, use **Settings → System → Restart Display Service** on the
+touchscreen, or restart the service over SSH:
 
 ```bash
 sudo systemctl restart bart-platform-display

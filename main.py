@@ -100,8 +100,9 @@ def main():
                     panel.open()
 
         panel.update(dt)
-        if panel.request_exit:
-            running = False  # systemd Restart=always relaunches with the new key
+        if panel.request_service_restart:
+            print('[system] display service restart requested', file=sys.stderr)
+            running = False  # systemd Restart=always relaunches the display
             continue
 
         rows, loading = departures.snapshot()
