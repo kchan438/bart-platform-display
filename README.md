@@ -44,8 +44,9 @@ bart-platform-display/
 
 The device is configured entirely from the touchscreen — no SSH needed:
 
-- **Swipe down** from the top edge to open the settings shade; **swipe up** to
-  return to the departure board.
+- **Swipe down** starting in the top 120 pixels to open the settings shade;
+  **swipe up** from any shade screen to return to the departure board. Override
+  the opening zone with `touch_tuning.panel_open_start_max_y` in `config.json`.
 - **Wi-Fi**: scan and list networks with signal strength, encryption, a *SAVED*
   tag for known networks, and the connected network marked *ONLINE*. Tap a
   network to Connect / Disconnect or view its info. Password-protected networks

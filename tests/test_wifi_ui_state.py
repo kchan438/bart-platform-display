@@ -44,6 +44,9 @@ class FakeKeyboard:
         self.on_submit = on_submit
         self.on_cancel = on_cancel
 
+    def handle(self, event):
+        pass
+
 
 fake_keyboard = types.ModuleType('bartdisplay.ui.keyboard')
 fake_keyboard.Keyboard = FakeKeyboard
@@ -67,6 +70,48 @@ with mock.patch.dict(
 
 
 class WifiUiStateTests(unittest.TestCase):
+    def test_upward_swipe_closes_panel_from_subview(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'wifi_detail'
+
+        panel.handle({
+            'kind': 'release',
+            'swipe': 'up',
+            'start_y': 200,
+        })
+
+        self.assertEqual(panel.state, 'CLOSING')
+
+    def test_upward_swipe_does_not_close_while_keyboard_is_open(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'apikey'
+        panel.keyboard = FakeKeyboard('API key')
+
+        panel.handle({
+            'kind': 'release',
+            'swipe': 'up',
+            'start_y': 200,
+        })
+
+        self.assertEqual(panel.state, 'OPEN')
+
+    def test_scrollbar_drag_release_does_not_close_panel(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'wifi'
+        panel._scrollbar_dragging = True
+
+        panel.handle({
+            'kind': 'release',
+            'swipe': 'up',
+            'start_y': 200,
+        })
+
+        self.assertEqual(panel.state, 'OPEN')
+        self.assertFalse(panel._scrollbar_dragging)
+
     def test_wrapped_detail_status_stays_above_action_buttons(self):
         panel = SettingsPanel()
         font = types.SimpleNamespace(

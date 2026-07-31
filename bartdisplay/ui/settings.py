@@ -73,6 +73,7 @@ class SettingsPanel:
         if self.state in ('OPEN', 'OPENING'):
             self.state = 'CLOSING'
             self.keyboard = None
+            self._scrollbar_dragging = False
 
     def _goto(self, view):
         previous = self.view
@@ -199,9 +200,12 @@ class SettingsPanel:
             self.keyboard.handle(event)
             return
 
-        # Swipe up returns to the board (from the menu, or grabbing the top edge).
-        if kind == 'release' and event.get('swipe') == 'up' and (
-                self.view == 'menu' or event.get('start_y', 999) < 70):
+        # Swipe up returns to the board from every panel view. Finishing a
+        # scrollbar-thumb drag must not also dismiss the panel.
+        if kind == 'release' and event.get('swipe') == 'up':
+            if self._scrollbar_dragging:
+                self._scrollbar_dragging = False
+                return
             self.close()
             return
 

@@ -63,5 +63,41 @@ class TouchMappingTests(unittest.TestCase):
         self.assertEqual(mapper(250, 1500), (359, 79))
 
 
+class PanelGestureTests(unittest.TestCase):
+    def tearDown(self):
+        fake_config.get_touch_tuning = lambda: {}
+
+    def test_downward_swipe_must_start_in_default_opening_zone(self):
+        event = {
+            'kind': 'release',
+            'swipe': 'down',
+            'start_y': 119,
+        }
+
+        self.assertTrue(touch_module.should_open_panel(event))
+
+        event['start_y'] = 120
+        self.assertFalse(touch_module.should_open_panel(event))
+
+    def test_opening_zone_can_be_overridden_per_device(self):
+        fake_config.get_touch_tuning = lambda: {
+            'panel_open_start_max_y': 180,
+        }
+
+        self.assertTrue(touch_module.should_open_panel({
+            'kind': 'release',
+            'swipe': 'down',
+            'start_y': 179,
+        }))
+
+    def test_only_downward_release_swipes_open_panel(self):
+        for event in (
+                {'kind': 'press', 'swipe': 'down', 'start_y': 0},
+                {'kind': 'release', 'swipe': 'up', 'start_y': 0},
+                {'kind': 'release', 'swipe': None, 'start_y': 0}):
+            with self.subTest(event=event):
+                self.assertFalse(touch_module.should_open_panel(event))
+
+
 if __name__ == '__main__':
     unittest.main()

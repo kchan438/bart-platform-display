@@ -30,7 +30,27 @@ TAP_MAX_MOVE = 32      # max net down->up travel to still count as a tap
 TAP_MAX_TIME = 0.6     # max duration to still count as a tap
 FLICK_MIN_DIST = 55    # min vertical travel to count as a flick/swipe
 FLICK_MAX_TIME = 0.6   # max duration for a flick
-TOP_EDGE = 45          # a swipe-down starting above this y opens the shade
+PANEL_OPEN_START_MAX_Y = 120  # downward swipe must start above this screen y
+
+
+def panel_open_start_max_y():
+    """Return the configured panel-opening zone, clamped to the display."""
+    tuning = config.get_touch_tuning() or {}
+    value = tuning.get('panel_open_start_max_y', PANEL_OPEN_START_MAX_Y)
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = PANEL_OPEN_START_MAX_Y
+    return max(1, min(display.H, value))
+
+
+def should_open_panel(event):
+    """Whether a semantic touch event should open the settings panel."""
+    return (
+        event.get('kind') == 'release'
+        and event.get('swipe') == 'down'
+        and event.get('start_y', display.H) < panel_open_start_max_y()
+    )
 
 
 class RawEvent:
