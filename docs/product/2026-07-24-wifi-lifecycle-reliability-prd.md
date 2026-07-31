@@ -79,8 +79,9 @@ from this document.
 
 ### Scan
 
-As a user, I can open Wi-Fi settings at any time and see nearby networks without
-restarting the application.
+As a user, I can open Wi-Fi settings at any time and immediately see
+NetworkManager's cached nearby networks without forcing another hardware scan.
+Only the explicit RESCAN control requests a new radio scan.
 
 As a user, if a scan temporarily fails, I see a useful error and recent results
 instead of an unexplained empty list.
@@ -131,6 +132,11 @@ profiles by UUID.
   of leaving the UI permanently busy.
 
 ### Fresh scanning
+
+Opening the Wi-Fi list, returning from network detail, and completing a
+connect/disconnect action must not trigger a hardware scan. Those paths may read
+NetworkManager's cached AP state with `--rescan no`. When the user explicitly
+selects RESCAN:
 
 1. Confirm that NetworkManager reports the Wi-Fi radio enabled. Do not
    automatically toggle it.
@@ -219,12 +225,22 @@ adapter's automatic activation state and previously selected the wrong semantic.
 - Rescan is disabled while any Wi-Fi operation is active.
 - Network rows are not tappable during a conflicting operation.
 - Back navigation is disabled during connect/disconnect.
-- Status messages are visible, width-bounded, and color coded.
+- Status messages are visible, color coded, and wrapped to at most two
+  width-bounded lines so the classified failure reason remains readable.
 - Disconnect remains on the detail page until it succeeds.
-- Successful connect/disconnect returns to the list and rescans.
-- A successful post-action scan retains the action confirmation.
-- A failed post-action scan takes precedence over the confirmation and explains
+- Opening the list performs a cache-only refresh; only RESCAN requests a
+  hardware scan.
+- Returning from network detail preserves the current list and scroll position
+  without starting another scan.
+- Successful connect/disconnect returns to the list and refreshes cached
+  NetworkManager state without a hardware scan.
+- A successful post-action refresh retains the action confirmation.
+- A failed post-action refresh takes precedence over the confirmation and explains
   that recent results are being shown.
+- The active network is first, followed by other saved networks, then unsaved
+  networks in the same combined list.
+- A right-side scrollbar provides touchscreen-sized up/down buttons and a
+  draggable thumb. Dragging the list body does not scroll it.
 - Saved authentication failure opens the password keyboard automatically.
 - Wi-Fi passwords start masked and have a labeled, touchscreen-sized
   `SHOW`/`HIDE` control that does not modify the entered text.
@@ -256,6 +272,10 @@ adapter's automatic activation state and previously selected the wrong semantic.
 
 Raw NetworkManager details may be written to the journal only when they contain
 no secret. Passwords and password-file contents must never be logged.
+Cache refreshes log a secret-free device-state snapshot containing the
+NetworkManager state/reason, whether an active profile exists, saved-profile
+count, and how many profiles have autoconnect disabled. SSIDs, profile names,
+UUIDs, and passwords are excluded from that snapshot.
 
 ## Minimal PolicyKit deployment
 
@@ -313,14 +333,20 @@ Automated tests must cover:
 - Mode-0600 temporary secret file and cleanup
 - Password show/hide touch behavior and default masking
 - Unsupported security detection
+- Cache-only list entry and post-action refresh
+- Explicit-only hardware rescanning
+- Active/saved/unsaved list ordering
+- Scrollbar button movement, thumb dragging, and bounds clamping
 
 Hardware validation must cover:
 
 - Initial scan compared with a raw diagnostic scan
+- Opening Wi-Fi and returning from detail without advancing `LastScan`
 - Repeated rescans
 - Rescan after 5, 15, and 30 minutes
 - Verified disconnect with profile retained
-- Scan immediately after disconnect
+- Cache-only state refresh immediately after disconnect
+- Saved-first ordering and scrollbar use on the physical touchscreen
 - Saved reconnect
 - Wrong password followed by correct password
 - New open network
@@ -333,6 +359,11 @@ Hardware validation must cover:
 
 - Nearby networks remain discoverable after the 30-minute soak without an app
   restart.
+- `LastScan` advances only after the user selects RESCAN, not while opening the
+  list, returning from detail, or completing connect/disconnect.
+- The active and saved networks remain at the top of the combined list.
+- The list is navigable with the right-side up/down buttons and draggable
+  scrollbar thumb without dragging the list body.
 - A degraded scan shows recent results with an explicit partial/error status.
 - Disconnect no longer invokes device-level disconnect.
 - Disconnect does not remove or alter the saved profile.

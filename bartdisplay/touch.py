@@ -127,9 +127,11 @@ class TouchReader:
 
         def mapper(rx, ry):
             if swap:
-                rx, ry = ry, rx
-            x = scale(rx, x_min, x_max, display.W)
-            y = scale(ry, y_min, y_max, display.H)
+                x = scale(ry, y_min, y_max, display.W)
+                y = scale(rx, x_min, x_max, display.H)
+            else:
+                x = scale(rx, x_min, x_max, display.W)
+                y = scale(ry, y_min, y_max, display.H)
             if inv_x:
                 x = display.W - 1 - x
             if inv_y:

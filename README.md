@@ -51,6 +51,9 @@ The device is configured entirely from the touchscreen — no SSH needed:
   network to Connect / Disconnect or view its info. Password-protected networks
   prompt for a password via the on-screen keyboard, with a large **Show/Hide**
   password button and a separate **Close** keyboard button.
+  Opening the list reads NetworkManager's cached results; only **Rescan**
+  requests a new hardware scan. Saved networks are kept at the top, and the
+  right-side scrollbar supports up/down taps plus thumb dragging.
   Live connection, authentication, IP-assignment, and disconnect status is
   shown. Recent results remain visible when a scan temporarily fails. Networks
   are saved by NetworkManager and auto-reconnect on boot.
@@ -290,6 +293,7 @@ sudo systemctl restart bart-platform-display
 | `LOADING...` stays forever | Check internet; run `journalctl -u bart-platform-display -f` for errors |
 | Wi-Fi action shows `Not authorized` | Reinstall the scoped PolicyKit rule above and confirm the required `nmcli general permissions` rows report `yes` |
 | A correct Wi-Fi password still times out | Run `journalctl -u bart-platform-display -u NetworkManager --since "-5 minutes" --no-pager` and inspect the terminal NetworkManager reason |
+| Wi-Fi disconnects after a successful connection | Open the Wi-Fi list once to record a cache-only state snapshot, then run `journalctl -u bart-platform-display -u NetworkManager --since "-30 minutes" --no-pager`. Look for the `[wifi] device=... state=... reason=... active_profile=... autoconnect_off=...` line; it excludes SSIDs, profile names, UUIDs, and passwords. |
 | pip pygame build fails | Use system pygame: `sudo apt install python3-pygame` and create venv with `--system-site-packages` |
 
 ---
