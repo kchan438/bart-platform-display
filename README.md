@@ -31,14 +31,18 @@ bart-platform-display/
 │       ├── keyboard.py             # on-screen keyboard
 │       └── settings.py            # Wi-Fi, API-key, and System panel
 ├── deploy/
-│   └── polkit/                    # minimal NetworkManager/reboot authorization
+│   ├── polkit/                    # minimal NetworkManager/reboot authorization
+│   └── splash/
+│       ├── bart-splash.png        # original, unchanged boot image
+│       └── show_splash.py         # one-shot framebuffer splash renderer
 ├── docs/product/                  # implementation-ready product requirements
 ├── tests/                         # Wi-Fi lifecycle regression tests
 ├── config.json                     # station, platform, API key
 ├── requirements.txt
 ├── fonts/
 │   └── PressStart2P-Regular.ttf    # must be downloaded (see below)
-└── bart-platform-display.service   # systemd unit for auto-start
+├── bart-platform-display-splash.service # boot-only splash systemd unit
+└── bart-platform-display.service   # app systemd unit for auto-start
 ```
 
 ## On-device settings panel
@@ -299,25 +303,61 @@ BART_DEV=1 python main.py
 ## 6 — Enable auto-start at boot
 
 ```bash
-# Copy the service file
-sudo cp ~/bart-platform-display/bart-platform-display.service \
+# Copy the splash and application service files
+sudo cp ~/bart-platform-display/bart-platform-display-splash.service \
+        ~/bart-platform-display/bart-platform-display.service \
         /etc/systemd/system/
 
-# Reload systemd and enable the service
+# Reload systemd and enable both services
 sudo systemctl daemon-reload
-sudo systemctl enable bart-platform-display
-sudo systemctl start bart-platform-display
+sudo systemctl enable bart-platform-display-splash bart-platform-display
 
-# Check status
-sudo systemctl status bart-platform-display
+# Reboot so the splash runs only as part of a full device boot
+sudo reboot
 ```
 
-The display will now start automatically on every boot. SSH is unaffected.
+After reconnecting over SSH, check both services:
+
+```bash
+sudo systemctl status \
+  bart-platform-display-splash \
+  bart-platform-display
+```
+
+The splash service loads `deploy/splash/bart-splash.png` directly. That file is
+the original supplied PNG, stored byte-for-byte without a generated replacement,
+crop, color change, or pre-rendered derivative. Because the TFT is 480x320, the
+service proportionally fits the image to the panel in memory, centers it on
+black, and writes it once to `/dev/fb0`. The application starts afterward and
+replaces the splash with the departure board.
+
+`RemainAfterExit=yes` keeps the one-shot splash service active for the rest of
+the boot. Restarting only `bart-platform-display` therefore does not show the
+boot splash again; a full Raspberry Pi reboot does. The renderer runs as the
+same unprivileged `kevinchan` user as the application and needs no additional
+PolicyKit or sudo permission. SSH is unaffected.
 
 **View logs:**
 
 ```bash
-journalctl -u bart-platform-display -f
+journalctl \
+  -u bart-platform-display-splash \
+  -u bart-platform-display \
+  -f
+```
+
+To inspect the splash result from the current boot:
+
+```bash
+journalctl -u bart-platform-display-splash -b --no-pager
+```
+
+To remove only the boot splash:
+
+```bash
+sudo systemctl disable bart-platform-display-splash
+sudo rm /etc/systemd/system/bart-platform-display-splash.service
+sudo systemctl daemon-reload
 ```
 
 ---
@@ -361,6 +401,7 @@ sudo systemctl restart bart-platform-display
 | Display shows login prompt / console text | Add `fbcon=map:10` to `/boot/firmware/cmdline.txt` and reboot |
 | `pygame.error: fbcon not available` | Expected on Raspbian trixie — SDL2 is built without fbcon/fbdev. The app uses `SDL_VIDEODRIVER=offscreen` and writes frames directly to `/dev/fb0` via mmap; no action needed |
 | Display stays white, `dd if=/dev/zero of=/dev/fb0` has no effect | fbcon is still active and overwriting the framebuffer — confirm `fbcon=map:10` is in `/boot/firmware/cmdline.txt` |
+| Boot splash does not appear | Run `systemctl status bart-platform-display-splash` and `journalctl -u bart-platform-display-splash -b --no-pager`; confirm the repository is at `/home/kevinchan/bart-platform-display` and `/dev/fb0` exists |
 | `Font not found` error | Place `PressStart2P-Regular.ttf` in `fonts/` |
 | `LOADING...` stays forever | Check internet; run `journalctl -u bart-platform-display -f` for errors |
 | Wi-Fi action shows `Not authorized` | Reinstall the scoped PolicyKit rule above and confirm the required `nmcli general permissions` rows report `yes` |
