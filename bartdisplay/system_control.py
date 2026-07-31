@@ -1,9 +1,9 @@
 """Narrow, asynchronous Raspberry Pi system-control operations.
 
-The display process remains unprivileged.  Full-device restart requests go
-through systemd-logind, whose PolicyKit policy is deployed separately.  The UI
-polls :class:`SystemActionJob` so a slow or denied request never blocks pygame's
-render and touch loop.
+The display process remains unprivileged. Full-device restart requests call
+systemd-logind's Reboot method over the system bus; its PolicyKit policy is
+deployed separately. The UI polls :class:`SystemActionJob` so a slow or denied
+request never blocks pygame's render and touch loop.
 """
 
 import os
@@ -15,6 +15,16 @@ import threading
 
 _REBOOT_TIMEOUT_SEC = 10
 _action_lock = threading.Lock()
+_LOGIND_REBOOT_ARGS = [
+    '--system',
+    'call',
+    'org.freedesktop.login1',
+    '/org/freedesktop/login1',
+    'org.freedesktop.login1.Manager',
+    'Reboot',
+    'b',
+    'false',
+]
 
 
 class ActionResult:
@@ -55,10 +65,10 @@ def _command_error(stdout, stderr):
 
 def request_reboot():
     """Request a normal systemd-logind reboot and return an ``ActionResult``."""
-    loginctl = shutil.which('loginctl')
-    if not loginctl:
+    busctl = shutil.which('busctl')
+    if not busctl:
         message = 'Device restart is unavailable'
-        print('[system] loginctl was not found', file=sys.stderr)
+        print('[system] busctl was not found', file=sys.stderr)
         return ActionResult(False, 'command_missing', message)
 
     env = os.environ.copy()
@@ -66,7 +76,7 @@ def request_reboot():
     env['LANG'] = 'C'
     try:
         process = subprocess.run(
-            [loginctl, 'reboot'],
+            [busctl] + _LOGIND_REBOOT_ARGS,
             capture_output=True,
             text=True,
             timeout=_REBOOT_TIMEOUT_SEC,
@@ -75,11 +85,11 @@ def request_reboot():
         )
     except subprocess.TimeoutExpired:
         message = 'Device restart request timed out'
-        print('[system] loginctl reboot timed out', file=sys.stderr)
+        print('[system] logind reboot request timed out', file=sys.stderr)
         return ActionResult(False, 'timeout', message)
     except OSError as exc:
         message = 'Could not request device restart'
-        print(f'[system] could not run loginctl: {exc}', file=sys.stderr)
+        print(f'[system] could not call logind: {exc}', file=sys.stderr)
         return ActionResult(False, 'command_failed', message)
 
     if process.returncode == 0:
@@ -96,8 +106,12 @@ def request_reboot():
         'access denied',
         'authentication is required',
         'interactive authentication required',
+        'interactive authorization required',
         'not authorized',
+        'not permitted',
+        'operation not permitted',
         'permission denied',
+        'accessdenied',
     ))
     code = 'permission_denied' if denied else 'reboot_failed'
     message = (
@@ -107,7 +121,7 @@ def request_reboot():
     )
     suffix = f': {detail}' if detail else ''
     print(
-        f'[system] loginctl reboot failed with exit '
+        f'[system] logind reboot request failed with exit '
         f'{process.returncode}{suffix}',
         file=sys.stderr,
     )

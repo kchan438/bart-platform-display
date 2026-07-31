@@ -17,13 +17,13 @@ class ImmediateThread:
 
 
 class SystemControlTests(unittest.TestCase):
-    def test_reboot_uses_exact_loginctl_command_without_a_shell(self):
+    def test_reboot_calls_logind_reboot_noninteractively_without_a_shell(self):
         completed = SimpleNamespace(returncode=0, stdout='', stderr='')
         with (
                 mock.patch.object(
                     system_control.shutil,
                     'which',
-                    return_value='/usr/bin/loginctl',
+                    return_value='/usr/bin/busctl',
                 ),
                 mock.patch.object(
                     system_control.subprocess,
@@ -36,13 +36,18 @@ class SystemControlTests(unittest.TestCase):
         self.assertEqual(result.code, 'accepted')
         run.assert_called_once()
         args, kwargs = run.call_args
-        self.assertEqual(args[0], ['/usr/bin/loginctl', 'reboot'])
+        self.assertEqual(
+            args[0],
+            ['/usr/bin/busctl'] + system_control._LOGIND_REBOOT_ARGS,
+        )
+        self.assertEqual(args[0][-3:], ['Reboot', 'b', 'false'])
+        self.assertNotIn('loginctl', args[0])
         self.assertFalse(kwargs['shell'])
         self.assertEqual(kwargs['timeout'], system_control._REBOOT_TIMEOUT_SEC)
         self.assertEqual(kwargs['env']['LC_ALL'], 'C')
         self.assertEqual(kwargs['env']['LANG'], 'C')
 
-    def test_missing_loginctl_is_a_visible_failure(self):
+    def test_missing_busctl_is_a_visible_failure(self):
         with mock.patch.object(
                 system_control.shutil,
                 'which',
@@ -63,7 +68,30 @@ class SystemControlTests(unittest.TestCase):
                 mock.patch.object(
                     system_control.shutil,
                     'which',
-                    return_value='/usr/bin/loginctl',
+                    return_value='/usr/bin/busctl',
+                ),
+                mock.patch.object(
+                    system_control.subprocess,
+                    'run',
+                    return_value=completed,
+                )):
+            result = system_control.request_reboot()
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, 'permission_denied')
+        self.assertEqual(result.message, 'Device restart is not authorized')
+
+    def test_operation_not_permitted_is_classified_as_authorization(self):
+        completed = SimpleNamespace(
+            returncode=1,
+            stdout='',
+            stderr='Call failed: Operation not permitted',
+        )
+        with (
+                mock.patch.object(
+                    system_control.shutil,
+                    'which',
+                    return_value='/usr/bin/busctl',
                 ),
                 mock.patch.object(
                     system_control.subprocess,
@@ -81,13 +109,14 @@ class SystemControlTests(unittest.TestCase):
                 mock.patch.object(
                     system_control.shutil,
                     'which',
-                    return_value='/usr/bin/loginctl',
+                    return_value='/usr/bin/busctl',
                 ),
                 mock.patch.object(
                     system_control.subprocess,
                     'run',
                     side_effect=subprocess.TimeoutExpired(
-                        ['/usr/bin/loginctl', 'reboot'],
+                        ['/usr/bin/busctl']
+                        + system_control._LOGIND_REBOOT_ARGS,
                         10,
                     ),
                 )):
@@ -107,7 +136,7 @@ class SystemControlTests(unittest.TestCase):
                 mock.patch.object(
                     system_control.shutil,
                     'which',
-                    return_value='/usr/bin/loginctl',
+                    return_value='/usr/bin/busctl',
                 ),
                 mock.patch.object(
                     system_control.subprocess,

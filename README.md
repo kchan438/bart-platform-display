@@ -25,7 +25,7 @@ bart-platform-display/
 │   ├── board.py                    # main departure-board render
 │   ├── touch.py                    # XPT2046 evdev reader + gesture recognizer
 │   ├── wifi.py                     # nmcli wrapper (scan/connect/disconnect/info)
-│   ├── system_control.py           # asynchronous systemd-logind reboot request
+│   ├── system_control.py           # async systemd-logind D-Bus reboot request
 │   └── ui/                         # swipe-down settings panel
 │       ├── widgets.py              # buttons + icon helpers
 │       ├── keyboard.py             # on-screen keyboard
@@ -111,8 +111,10 @@ Restarting only the display service does not need elevated permission. The app
 exits cleanly and the existing `Restart=always` systemd policy relaunches it
 after five seconds.
 
-A full Raspberry Pi reboot uses `loginctl reboot`. Install the separate
-reboot-only PolicyKit rule:
+A full Raspberry Pi reboot calls systemd-logind's `Reboot(false)` method over
+the system D-Bus using `busctl`. The `false` argument disables interactive
+authentication, which is unavailable to the headless service. Install the
+separate reboot-only PolicyKit rule:
 
 ```bash
 sudo install -o root -g root -m 0644 \
@@ -137,8 +139,8 @@ sudo pkcheck \
 ```
 
 An exit status of `0` means the service process is authorized. Because the rule
-is intentionally scoped to the systemd unit, running `loginctl reboot` from an
-ordinary SSH shell as `kevinchan` is not expected to receive this grant.
+is intentionally scoped to the systemd unit, calling the same logind method
+from an ordinary SSH shell as `kevinchan` is not expected to receive this grant.
 
 For end-to-end device validation, record both values before testing:
 
