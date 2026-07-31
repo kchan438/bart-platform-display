@@ -28,6 +28,7 @@ fake_display.C = {
 fake_display.W = 480
 fake_display.H = 320
 fake_display.PAD = 14
+fake_display.DEV = False
 
 
 class FakeKeyboard:
@@ -236,6 +237,7 @@ class WifiUiStateTests(unittest.TestCase):
             def __init__(self, rect, label, **kwargs):
                 self.rect = rect
                 self.label = label
+                self.enabled = kwargs.get('enabled', True)
                 buttons.append(self)
 
             def draw(self):
@@ -278,6 +280,55 @@ class WifiUiStateTests(unittest.TestCase):
             service_rect[1] + service_rect[3],
             device_rect[1],
         )
+
+    def test_system_view_disables_device_restart_in_dev_mode(self):
+        panel = SettingsPanel()
+        buttons = []
+
+        class RecordingButton:
+            def __init__(self, rect, label, **kwargs):
+                self.label = label
+                self.enabled = kwargs.get('enabled', True)
+                buttons.append(self)
+
+            def draw(self):
+                pass
+
+        with (
+                mock.patch.object(
+                    settings_module,
+                    'Button',
+                    RecordingButton,
+                ),
+                mock.patch.object(
+                    panel,
+                    '_header',
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    settings_module.display,
+                    'DEV',
+                    True,
+                ),
+                mock.patch.object(
+                    settings_module.display,
+                    'blit_center',
+                    return_value=None,
+                    create=True,
+                ),
+                mock.patch.object(
+                    settings_module.display,
+                    'font_xs',
+                    object(),
+                    create=True,
+                )):
+            panel._render_system()
+
+        device = next(
+            button for button in buttons
+            if button.label == 'RESTART RASPBERRY PI'
+        )
+        self.assertFalse(device.enabled)
 
     def test_scrollbar_drag_release_does_not_close_panel(self):
         panel = SettingsPanel()

@@ -1238,6 +1238,7 @@ class SettingsPanel:
         if self.system_state in ('confirming', 'dispatching'):
             self._render_system_confirmation(btns)
             return
+        device_restart_enabled = not display.DEV
 
         service = Button(
             (PAD, 52, W - 2 * PAD, 50),
@@ -1268,17 +1269,26 @@ class SettingsPanel:
             on_tap=lambda _b: self._begin_system_confirmation('device'),
             font=display.font_xs,
             fg=C['err'],
+            enabled=device_restart_enabled,
         )
         device.draw()
         display.blit_center(
-            'Reboots the entire device.',
+            (
+                'Reboots the entire device.'
+                if device_restart_enabled
+                else 'Unavailable in dev mode.'
+            ),
             display.font_xs,
             C['dim'],
             W // 2,
             220,
         )
         display.blit_center(
-            'Display unavailable.',
+            (
+                'Display unavailable.'
+                if device_restart_enabled
+                else 'Use service restart only.'
+            ),
             display.font_xs,
             C['ghost'],
             W // 2,

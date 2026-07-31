@@ -134,8 +134,7 @@ Confirm the running service is the authorization subject:
 SERVICE_PID="$(systemctl show --property MainPID --value bart-platform-display)"
 sudo pkcheck \
   --action-id org.freedesktop.login1.reboot \
-  --process "$SERVICE_PID" \
-  --allow-user-interaction=no
+  --process "$SERVICE_PID"
 ```
 
 An exit status of `0` means the service process is authorized. Because the rule
@@ -288,7 +287,8 @@ The TFT should show the departure board. Press `Ctrl+C` to exit.
 Set `BART_DEV=1` to run in a normal window instead of the framebuffer, with the
 mouse standing in for touch (click = tap, click-drag = swipe/scroll). Wi-Fi and
 touch hardware are mocked, so the settings panel UI can be built and tested off
-the Pi:
+the Pi. Full-device restart is disabled in this mode so exercising the System
+view cannot reboot the development computer:
 
 ```bash
 BART_DEV=1 python main.py

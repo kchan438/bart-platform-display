@@ -17,6 +17,27 @@ class ImmediateThread:
 
 
 class SystemControlTests(unittest.TestCase):
+    def test_dev_mode_blocks_reboot_before_resolving_busctl(self):
+        with (
+                mock.patch.dict(
+                    system_control.os.environ,
+                    {'BART_DEV': '1'},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    system_control.shutil,
+                    'which',
+                ) as which):
+            result = system_control.request_reboot()
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, 'dev_mode')
+        self.assertEqual(
+            result.message,
+            'Device restart is disabled in dev mode',
+        )
+        which.assert_not_called()
+
     def test_reboot_calls_logind_reboot_noninteractively_without_a_shell(self):
         completed = SimpleNamespace(returncode=0, stdout='', stderr='')
         with (

@@ -65,6 +65,11 @@ def _command_error(stdout, stderr):
 
 def request_reboot():
     """Request a normal systemd-logind reboot and return an ``ActionResult``."""
+    if os.environ.get('BART_DEV') == '1':
+        message = 'Device restart is disabled in dev mode'
+        print('[system] device restart blocked in dev mode', file=sys.stderr)
+        return ActionResult(False, 'dev_mode', message)
+
     busctl = shutil.which('busctl')
     if not busctl:
         message = 'Device restart is unavailable'
