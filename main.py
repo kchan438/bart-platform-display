@@ -9,7 +9,7 @@ import sys
 
 import pygame
 
-from bartdisplay import board, config, departures, display
+from bartdisplay import board, config, departures, display, wifi
 from bartdisplay.touch import (
     GestureRecognizer,
     RawEvent,
@@ -43,6 +43,7 @@ def main():
     config.load()
     display.init()
     departures.start()
+    wifi.start_connection_supervisor()
 
     gestures = GestureRecognizer()
     reader = None
@@ -110,6 +111,7 @@ def main():
             display.draw_cursor(*cursor_pos, active=cursor_active)
         display.present()
 
+    wifi.stop_connection_supervisor()
     pygame.quit()
 
 

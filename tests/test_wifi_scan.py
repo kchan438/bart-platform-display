@@ -96,6 +96,31 @@ class WifiTests(unittest.TestCase):
         self.assertTrue(nets[0].active)
         self.assertEqual(nets[0].signal, 30)
         self.assertEqual(nets[0].bssid, 'AA:00:00:00:00:01')
+        self.assertTrue(nets[0].in_use)
+
+    def test_multi_pass_union_preserves_confirmed_in_use_bssid(self):
+        profiles = {'Home': [profile()]}
+        first = wifi._parse_scan_output(
+            r'*:30:WPA2:Home:AA\:00\:00\:00\:00\:01:wlan0',
+            profiles,
+            active(),
+            now=10.0,
+        )
+        second = wifi._parse_scan_output(
+            r' :90:WPA2:Home:AA\:00\:00\:00\:00\:02:wlan0',
+            profiles,
+            active(),
+            now=11.0,
+        )
+
+        bssids = wifi._union_scan_passes(first, second)
+        combined = wifi._deduplicate_scan_networks(bssids)
+
+        self.assertEqual(len(bssids), 2)
+        self.assertEqual(len(combined), 1)
+        self.assertTrue(combined[0].in_use)
+        self.assertEqual(combined[0].signal, 30)
+        self.assertEqual(combined[0].bssid, 'AA:00:00:00:00:01')
 
     def test_connected_profile_remains_visible_when_scan_omits_it(self):
         profiles = {'Home': [profile()]}
@@ -107,6 +132,29 @@ class WifiTests(unittest.TestCase):
         self.assertTrue(nets[0].active)
         self.assertTrue(nets[0].saved)
         self.assertEqual(nets[0].profile_uuid, 'uuid-home')
+        self.assertFalse(nets[0].detected)
+
+    def test_every_saved_ssid_remains_visible_when_not_detected(self):
+        profiles = {
+            'Home': [profile()],
+            'Holmes Guest': [
+                profile('Holmes Guest', 'holmes-profile', 'uuid-holmes'),
+            ],
+        }
+
+        nets = wifi._parse_scan_output(
+            r' :75:WPA2:Home:AA\:00\:00\:00\:00\:01:wlan0',
+            profiles,
+            wifi.ActiveConnection('wlan0'),
+            now=10.0,
+        )
+
+        self.assertEqual([net.ssid for net in nets], ['Home', 'Holmes Guest'])
+        self.assertTrue(nets[0].detected)
+        self.assertTrue(nets[1].saved)
+        self.assertFalse(nets[1].detected)
+        self.assertFalse(nets[1].active)
+        self.assertEqual(nets[1].profile_uuid, 'uuid-holmes')
 
     def test_saved_profiles_use_wireless_ssid_instead_of_profile_name(self):
         def fake_run(args, timeout=20, input_text=None):
@@ -254,6 +302,11 @@ class WifiTests(unittest.TestCase):
                     wifi,
                     '_verify_connected',
                     return_value=(True, 'uuid-home', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_ensure_profile_autoconnect',
+                    return_value=(0, '', ''),
                 ):
             wifi._connect_worker(job, net, None)
 
@@ -306,7 +359,7 @@ class WifiTests(unittest.TestCase):
                 ), \
                 mock.patch.object(
                     wifi,
-                    '_enable_profile_autoconnect',
+                    '_ensure_profile_autoconnect',
                     return_value=(0, '', ''),
                 ):
             wifi._connect_worker(job, net, 'replacement')
@@ -373,6 +426,555 @@ class WifiTests(unittest.TestCase):
         self.assertEqual(networks, [])
         self.assertFalse(partial)
 
+    def test_all_failed_rescan_passes_keep_cache_stale_without_refreshing_ttl(self):
+        cached_home = wifi.Network(
+            'Holmes Guest',
+            84,
+            'WPA2',
+            saved=True,
+            profile_name='holmes-profile',
+            profile_uuid='uuid-holmes',
+        )
+        cached_neighbor = wifi.Network('Neighbor', 55, 'WPA2')
+        with mock.patch.object(wifi.time, 'monotonic', return_value=100.0):
+            wifi._merge_scan_cache([cached_home, cached_neighbor])
+
+        profiles = {
+            'Holmes Guest': [
+                profile(
+                    'Holmes Guest',
+                    'holmes-profile',
+                    'uuid-holmes',
+                ),
+            ],
+        }
+        connected = wifi.ActiveConnection(
+            'wlan0',
+            state='100 (connected)',
+            uuid='uuid-holmes',
+        )
+        failure = (
+            False,
+            'scan_timeout',
+            'Scan timed out',
+            'LastScan did not advance',
+        )
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(wifi.time, 'monotonic', return_value=110.0), \
+                mock.patch.object(wifi, '_wifi_radio', return_value='enabled'), \
+                mock.patch.object(
+                    wifi,
+                    '_wifi_iface_detailed',
+                    return_value=('wlan0', 'ok', '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery(profiles),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=connected,
+                ), \
+                mock.patch.object(wifi, '_log_connection_snapshot'), \
+                mock.patch.object(
+                    wifi,
+                    '_request_rescan_and_wait',
+                    return_value=failure,
+                ) as request, \
+                mock.patch.object(wifi, '_read_scan_rows') as read:
+            result = wifi._scan_detailed_unlocked(rescan=True)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, 'scan_timeout')
+        self.assertTrue(result.partial)
+        self.assertEqual(request.call_count, 2)
+        read.assert_not_called()
+
+        by_ssid = {network.ssid: network for network in result.networks}
+        self.assertEqual(set(by_ssid), {'Holmes Guest', 'Neighbor'})
+        self.assertTrue(by_ssid['Holmes Guest'].active)
+        self.assertTrue(by_ssid['Holmes Guest'].saved)
+        self.assertTrue(by_ssid['Holmes Guest'].stale)
+        self.assertFalse(by_ssid['Holmes Guest'].detected)
+        self.assertFalse(by_ssid['Holmes Guest'].in_use)
+        self.assertEqual(by_ssid['Holmes Guest'].signal, 84)
+        self.assertTrue(by_ssid['Neighbor'].stale)
+        self.assertFalse(by_ssid['Neighbor'].detected)
+        self.assertEqual(wifi._scan_cache['Holmes Guest'].last_seen, 100.0)
+        self.assertEqual(wifi._scan_cache['Neighbor'].last_seen, 100.0)
+
+    def test_failed_then_verified_pass_unions_only_verified_rows(self):
+        with mock.patch.object(wifi.time, 'monotonic', return_value=100.0):
+            wifi._merge_scan_cache([wifi.Network('Recent', 45, 'WPA2')])
+
+        fresh = [
+            wifi.Network(
+                'Fresh',
+                75,
+                'WPA2',
+                bssid='AA:00:00:00:00:01',
+                iface='wlan0',
+            ),
+        ]
+        requests = [
+            (
+                False,
+                'scan_timeout',
+                'Scan timed out',
+                'LastScan did not advance',
+            ),
+            (True, 'ok', '', ''),
+        ]
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(wifi.time, 'monotonic', return_value=110.0), \
+                mock.patch.object(wifi, '_wifi_radio', return_value='enabled'), \
+                mock.patch.object(
+                    wifi,
+                    '_wifi_iface_detailed',
+                    return_value=('wlan0', 'ok', '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=wifi.ActiveConnection('wlan0'),
+                ), \
+                mock.patch.object(wifi, '_log_connection_snapshot'), \
+                mock.patch.object(
+                    wifi,
+                    '_request_rescan_and_wait',
+                    side_effect=requests,
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_read_scan_rows',
+                    return_value=(fresh, 'ok', '', ''),
+                ) as read:
+            result = wifi._scan_detailed_unlocked(rescan=True)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, 'scan_timeout')
+        read.assert_called_once()
+        by_ssid = {network.ssid: network for network in result.networks}
+        self.assertTrue(by_ssid['Fresh'].detected)
+        self.assertFalse(by_ssid['Fresh'].stale)
+        self.assertEqual(wifi._scan_cache['Fresh'].last_seen, 110.0)
+        self.assertFalse(by_ssid['Recent'].detected)
+        self.assertTrue(by_ssid['Recent'].stale)
+        self.assertEqual(wifi._scan_cache['Recent'].last_seen, 100.0)
+
+    def test_failed_final_pass_keeps_verified_rows_but_uses_final_activity(self):
+        profiles = {'Home': [profile()]}
+        verified = [
+            wifi.Network(
+                'Home',
+                70,
+                'WPA2',
+                saved=True,
+                active=True,
+                in_use=True,
+                bssid='AA:00:00:00:00:01',
+                iface='wlan0',
+                profile_name='netplan-home',
+                profile_uuid='uuid-home',
+            ),
+        ]
+        final_disconnected = wifi.ActiveConnection(
+            'wlan0',
+            state='30 (disconnected)',
+            uuid='uuid-home',
+        )
+        requests = [
+            (True, 'ok', '', ''),
+            (
+                False,
+                'scan_timeout',
+                'Scan timed out',
+                'LastScan did not advance',
+            ),
+        ]
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(wifi, '_wifi_radio', return_value='enabled'), \
+                mock.patch.object(
+                    wifi,
+                    '_wifi_iface_detailed',
+                    return_value=('wlan0', 'ok', '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery(profiles),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    side_effect=[active(), final_disconnected],
+                ), \
+                mock.patch.object(wifi, '_log_connection_snapshot'), \
+                mock.patch.object(
+                    wifi,
+                    '_request_rescan_and_wait',
+                    side_effect=requests,
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_read_scan_rows',
+                    return_value=(verified, 'ok', '', ''),
+                ) as read:
+            result = wifi._scan_detailed_unlocked(rescan=True)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, 'scan_timeout')
+        read.assert_called_once()
+        self.assertEqual(len(result.networks), 1)
+        self.assertTrue(result.networks[0].detected)
+        self.assertFalse(result.networks[0].stale)
+        self.assertFalse(result.networks[0].active)
+        self.assertFalse(result.networks[0].in_use)
+
+    def test_failed_final_pass_rebinds_verified_row_to_new_active_profile(self):
+        profiles = {
+            'Home': [
+                profile('Home', 'profile-a', 'uuid-a'),
+                profile('Home', 'profile-b', 'uuid-b'),
+            ],
+        }
+        verified = [
+            wifi.Network(
+                'Home',
+                70,
+                'WPA2',
+                saved=True,
+                active=True,
+                in_use=True,
+                bssid='AA:00:00:00:00:01',
+                iface='wlan0',
+                profile_name='profile-a',
+                profile_uuid='uuid-a',
+            ),
+        ]
+        active_a = wifi.ActiveConnection(
+            'wlan0',
+            state='100 (connected)',
+            name='profile-a',
+            uuid='uuid-a',
+        )
+        active_b = wifi.ActiveConnection(
+            'wlan0',
+            state='100 (connected)',
+            name='profile-b',
+            uuid='uuid-b',
+        )
+        requests = [
+            (True, 'ok', '', ''),
+            (
+                False,
+                'scan_timeout',
+                'Scan timed out',
+                'LastScan did not advance',
+            ),
+        ]
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(wifi, '_wifi_radio', return_value='enabled'), \
+                mock.patch.object(
+                    wifi,
+                    '_wifi_iface_detailed',
+                    return_value=('wlan0', 'ok', '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery(profiles),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    side_effect=[active_a, active_b],
+                ), \
+                mock.patch.object(wifi, '_log_connection_snapshot'), \
+                mock.patch.object(
+                    wifi,
+                    '_request_rescan_and_wait',
+                    side_effect=requests,
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_read_scan_rows',
+                    return_value=(verified, 'ok', '', ''),
+                ) as read:
+            result = wifi._scan_detailed_unlocked(rescan=True)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, 'scan_timeout')
+        read.assert_called_once()
+        self.assertEqual(len(result.networks), 1)
+        self.assertTrue(result.networks[0].detected)
+        self.assertTrue(result.networks[0].active)
+        self.assertFalse(result.networks[0].in_use)
+        self.assertEqual(result.networks[0].profile_name, 'profile-b')
+        self.assertEqual(result.networks[0].profile_uuid, 'uuid-b')
+
+    def test_manual_scan_uses_final_activity_state_after_union(self):
+        pass_one = [
+            wifi.Network(
+                'Home',
+                35,
+                'WPA2',
+                active=True,
+                bssid='AA:00:00:00:00:01',
+                iface='wlan0',
+            ),
+        ]
+        pass_two = [
+            wifi.Network(
+                'Home',
+                90,
+                'WPA2',
+                bssid='AA:00:00:00:00:02',
+                iface='wlan0',
+            ),
+            wifi.Network('Neighbor', 60, 'WPA2', iface='wlan0'),
+        ]
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(wifi, '_wifi_radio', return_value='enabled'), \
+                mock.patch.object(
+                    wifi,
+                    '_wifi_iface_detailed',
+                    return_value=('wlan0', 'ok', '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=wifi.ActiveConnection('wlan0'),
+                ), \
+                mock.patch.object(wifi, '_log_connection_snapshot'), \
+                mock.patch.object(
+                    wifi,
+                    '_request_rescan_and_wait',
+                    return_value=(True, 'ok', '', ''),
+                ) as request, \
+                mock.patch.object(
+                    wifi,
+                    '_read_scan_rows',
+                    side_effect=[
+                        (pass_one, 'ok', '', ''),
+                        (pass_two, 'ok', '', ''),
+                    ],
+                ):
+            result = wifi._scan_detailed_unlocked(rescan=True)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(
+            [net.ssid for net in result.networks],
+            ['Home', 'Neighbor'],
+        )
+        self.assertFalse(result.networks[0].active)
+        self.assertEqual(result.networks[0].signal, 90)
+        self.assertEqual(result.networks[0].bssid, 'AA:00:00:00:00:02')
+
+    def test_final_disconnected_state_clears_stale_uuid_and_in_use_flags(self):
+        first = [
+            wifi.Network(
+                'Home',
+                35,
+                'WPA2',
+                saved=True,
+                active=True,
+                in_use=True,
+                bssid='AA:00:00:00:00:01',
+                profile_uuid='uuid-home',
+            ),
+        ]
+        final = [
+            wifi.Network(
+                'Home',
+                90,
+                'WPA2',
+                saved=True,
+                bssid='AA:00:00:00:00:02',
+                profile_uuid='uuid-home',
+            ),
+        ]
+        stale_uuid = wifi.ActiveConnection(
+            'wlan0',
+            state='30 (disconnected)',
+            uuid='uuid-home',
+        )
+
+        union = wifi._union_scan_passes(first, final)
+        reconciled = wifi._reconcile_scan_activity(
+            union,
+            final,
+            stale_uuid,
+        )
+        result = wifi._deduplicate_scan_networks(reconciled)
+
+        self.assertEqual(len(result), 1)
+        self.assertFalse(result[0].active)
+        self.assertFalse(result[0].in_use)
+        self.assertEqual(result[0].signal, 90)
+        self.assertEqual(result[0].bssid, 'AA:00:00:00:00:02')
+
+    def test_final_row_identity_replaces_earlier_profile_before_activity(self):
+        earlier = [
+            wifi.Network(
+                'Home',
+                80,
+                'WPA2',
+                saved=True,
+                active=True,
+                in_use=True,
+                bssid='AA:00:00:00:00:01',
+                profile_name='profile-a',
+                profile_uuid='uuid-a',
+            ),
+        ]
+        final = [
+            wifi.Network(
+                'Home',
+                70,
+                'WPA2',
+                saved=True,
+                active=True,
+                in_use=True,
+                bssid='AA:00:00:00:00:01',
+                profile_name='profile-b',
+                profile_uuid='uuid-b',
+            ),
+        ]
+        final_active = wifi.ActiveConnection(
+            'wlan0',
+            state='100 (connected)',
+            uuid='uuid-b',
+        )
+
+        union = wifi._union_scan_passes(earlier, final)
+        self.assertEqual(union[0].profile_uuid, 'uuid-a')
+
+        result = wifi._reconcile_scan_activity(
+            union,
+            final,
+            final_active,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].profile_name, 'profile-b')
+        self.assertEqual(result[0].profile_uuid, 'uuid-b')
+        self.assertTrue(result[0].active)
+        self.assertTrue(result[0].in_use)
+
+    def test_manual_scan_adds_third_pass_only_for_severe_collapse(self):
+        baseline = [
+            wifi.Network(f'Network {index}', 50, 'WPA2')
+            for index in range(6)
+        ]
+        wifi._merge_scan_cache(baseline)
+        collapsed = [wifi.Network('Network 0', 55, 'WPA2', iface='wlan0')]
+        recovered = [
+            wifi.Network(f'Network {index}', 55, 'WPA2', iface='wlan0')
+            for index in range(1, 5)
+        ]
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(wifi, '_wifi_radio', return_value='enabled'), \
+                mock.patch.object(
+                    wifi,
+                    '_wifi_iface_detailed',
+                    return_value=('wlan0', 'ok', '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=wifi.ActiveConnection('wlan0'),
+                ), \
+                mock.patch.object(wifi, '_log_connection_snapshot'), \
+                mock.patch.object(
+                    wifi,
+                    '_request_rescan_and_wait',
+                    return_value=(True, 'ok', '', ''),
+                ) as request, \
+                mock.patch.object(
+                    wifi,
+                    '_read_scan_rows',
+                    side_effect=[
+                        (collapsed, 'ok', '', ''),
+                        (collapsed, 'ok', '', ''),
+                        (recovered, 'ok', '', ''),
+                    ],
+                ):
+            result = wifi._scan_detailed_unlocked(rescan=True)
+
+        self.assertEqual(request.call_count, 3)
+        self.assertNotEqual(result.code, 'scan_degraded')
+        self.assertEqual(
+            {net.ssid for net in result.networks if net.detected},
+            {f'Network {index}' for index in range(5)},
+        )
+
+    def test_manual_scan_reports_persistent_collapse_as_degraded(self):
+        wifi._merge_scan_cache([
+            wifi.Network(f'Network {index}', 50, 'WPA2')
+            for index in range(6)
+        ])
+        collapsed = [wifi.Network('Network 0', 55, 'WPA2', iface='wlan0')]
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(wifi, '_wifi_radio', return_value='enabled'), \
+                mock.patch.object(
+                    wifi,
+                    '_wifi_iface_detailed',
+                    return_value=('wlan0', 'ok', '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=wifi.ActiveConnection('wlan0'),
+                ), \
+                mock.patch.object(wifi, '_log_connection_snapshot'), \
+                mock.patch.object(
+                    wifi,
+                    '_request_rescan_and_wait',
+                    return_value=(True, 'ok', '', ''),
+                ) as request, \
+                mock.patch.object(
+                    wifi,
+                    '_read_scan_rows',
+                    side_effect=[
+                        (collapsed, 'ok', '', ''),
+                        (collapsed, 'ok', '', ''),
+                        (collapsed, 'ok', '', ''),
+                    ],
+                ):
+            result = wifi._scan_detailed_unlocked(rescan=True)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(result.code, 'scan_degraded')
+        self.assertTrue(result.partial)
+        self.assertIn('incomplete', result.message)
+
     def test_scan_reports_disabled_radio_without_enabling_it(self):
         with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
                 mock.patch.object(wifi, '_wifi_radio', return_value='disabled'), \
@@ -384,11 +986,77 @@ class WifiTests(unittest.TestCase):
         self.assertEqual(result.message, 'Wi-Fi is disabled')
         run.assert_not_called()
 
+    def test_scan_fails_when_radio_state_query_fails(self):
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(wifi, '_wifi_radio', return_value=''), \
+                mock.patch.object(wifi, '_wifi_iface_detailed') as iface:
+            result = wifi._scan_detailed_unlocked(rescan=True)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, 'radio_query_failed')
+        self.assertEqual(result.message, 'Could not read Wi-Fi radio state')
+        iface.assert_not_called()
+
+    def test_scan_fails_for_missing_or_unmanaged_adapter(self):
+        failures = [
+            (
+                ('', 'adapter_missing', 'Wi-Fi adapter not found', ''),
+                'adapter_missing',
+            ),
+            (
+                ('', 'adapter_unmanaged', 'Wi-Fi adapter is unmanaged', ''),
+                'adapter_unmanaged',
+            ),
+        ]
+        for discovery_result, expected_code in failures:
+            with self.subTest(code=expected_code), \
+                    mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                    mock.patch.object(
+                        wifi,
+                        '_wifi_radio',
+                        return_value='enabled',
+                    ), \
+                    mock.patch.object(
+                        wifi,
+                        '_wifi_iface_detailed',
+                        return_value=discovery_result,
+                    ), \
+                    mock.patch.object(
+                        wifi,
+                        '_request_rescan_and_wait',
+                    ) as request:
+                result = wifi._scan_detailed_unlocked(rescan=True)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, expected_code)
+            request.assert_not_called()
+
+    def test_adapter_discovery_does_not_accept_unmanaged_wlan0(self):
+        with mock.patch.object(
+                wifi,
+                '_run',
+                return_value=(0, 'wlan0:wifi:unmanaged\n', ''),
+        ) as run:
+            result = wifi._wifi_iface_detailed()
+
+        self.assertEqual(
+            result,
+            ('', 'adapter_unmanaged', 'Wi-Fi adapter is unmanaged', ''),
+        )
+        run.assert_called_once_with(
+            ['-t', '-f', 'DEVICE,TYPE,STATE', 'device'],
+            timeout=10,
+        )
+
     def test_cache_only_refresh_does_not_request_hardware_rescan(self):
         cached = wifi.Network('Home', 80, 'WPA2', iface='wlan0')
         with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
                 mock.patch.object(wifi, '_wifi_radio', return_value='enabled'), \
-                mock.patch.object(wifi, 'wifi_iface', return_value='wlan0'), \
+                mock.patch.object(
+                    wifi,
+                    '_wifi_iface_detailed',
+                    return_value=('wlan0', 'ok', '', ''),
+                ), \
                 mock.patch.object(
                     wifi,
                     '_saved_profiles_detailed',
@@ -504,7 +1172,8 @@ class WifiTests(unittest.TestCase):
         discard.assert_called_once_with(net, 'uuid-home')
 
     def test_scan_waits_for_last_scan_to_advance(self):
-        with mock.patch.object(wifi, '_device_dbus_path', return_value='/device/2'), \
+        with mock.patch.object(wifi, '_HAVE_BUSCTL', True), \
+                mock.patch.object(wifi, '_device_dbus_path', return_value='/device/2'), \
                 mock.patch.object(wifi, '_last_scan', side_effect=[100, 100, 101]), \
                 mock.patch.object(wifi, '_run', return_value=(0, '', '')) as run, \
                 mock.patch.object(wifi.time, 'sleep'):
@@ -514,6 +1183,58 @@ class WifiTests(unittest.TestCase):
         run.assert_called_once_with(
             ['device', 'wifi', 'rescan', 'ifname', 'wlan0'],
             timeout=15,
+        )
+
+    def test_scan_reports_unavailable_lastscan_verification(self):
+        with mock.patch.object(wifi, '_HAVE_BUSCTL', True), \
+                mock.patch.object(wifi, '_device_dbus_path', return_value=''), \
+                mock.patch.object(wifi, '_last_scan', return_value=None), \
+                mock.patch.object(wifi, '_run', return_value=(0, '', '')), \
+                mock.patch.object(wifi.time, 'sleep'):
+            result = wifi._request_rescan_and_wait('wlan0')
+
+        self.assertFalse(result[0])
+        self.assertEqual(result[1], 'scan_verification_failed')
+        self.assertIn('verify', result[2])
+
+    def test_rescan_command_timeout_uses_scan_timeout_code(self):
+        with mock.patch.object(wifi, '_device_dbus_path', return_value=''), \
+                mock.patch.object(
+                    wifi,
+                    '_run',
+                    return_value=(124, '', 'command timed out'),
+                ):
+            result = wifi._request_rescan_and_wait('wlan0')
+
+        self.assertFalse(result[0])
+        self.assertEqual(result[1], 'scan_timeout')
+        self.assertEqual(result[2], 'Scan timed out')
+
+    def test_actionable_scan_error_wins_over_profile_query_failure(self):
+        existing = (
+            'profile_query_failed',
+            'Saved network status unavailable',
+            '',
+        )
+        authorization = ('not_authorized', 'Not authorized', 'permission denied')
+
+        result = wifi._prefer_scan_error(existing, authorization)
+
+        self.assertEqual(result, authorization)
+
+    def test_command_timeout_is_normalized_and_ranked_as_scan_timeout(self):
+        profile_error = (
+            'profile_query_failed',
+            'Saved network status unavailable',
+            '',
+        )
+        command_timeout = ('timeout', 'Timed out', 'command timed out')
+
+        result = wifi._prefer_scan_error(profile_error, command_timeout)
+
+        self.assertEqual(
+            result,
+            ('scan_timeout', 'Scan timed out', 'command timed out'),
         )
 
     def test_disconnect_uses_active_uuid_not_ssid_or_device_down(self):
@@ -720,7 +1441,7 @@ class WifiTests(unittest.TestCase):
                 ), \
                 mock.patch.object(
                     wifi,
-                    '_enable_profile_autoconnect',
+                    '_ensure_profile_autoconnect',
                     return_value=(0, '', ''),
                 ) as enable_autoconnect:
             wifi._connect_worker(job, net, None)
@@ -731,7 +1452,7 @@ class WifiTests(unittest.TestCase):
             'wlan0',
             password=None,
         )
-        enable_autoconnect.assert_not_called()
+        enable_autoconnect.assert_called_once_with('uuid-home')
 
     def test_saved_authentication_failure_requests_new_password(self):
         net = wifi.Network(
@@ -822,13 +1543,18 @@ class WifiTests(unittest.TestCase):
                     wifi,
                     '_cancel_activation',
                     return_value=True,
-                ) as cancel:
+                ) as cancel, \
+                mock.patch.object(
+                    wifi,
+                    '_unblock_profile_autoconnect',
+                ) as unblock:
             wifi._connect_worker(job, net, None)
 
         cancel.assert_called_once_with('uuid-home', 'wlan0')
         self.assertFalse(job.ok)
         self.assertEqual(job.code, 'authentication_failed')
         self.assertTrue(job.needs_password)
+        unblock.assert_not_called()
 
     def test_profile_activation_uses_bounded_nmcli_wait(self):
         with mock.patch.object(
@@ -1097,7 +1823,7 @@ class WifiTests(unittest.TestCase):
                 ), \
                 mock.patch.object(
                     wifi,
-                    '_enable_profile_autoconnect',
+                    '_ensure_profile_autoconnect',
                     return_value=(0, '', ''),
                 ) as enable_autoconnect:
             wifi._connect_worker(first_job, net, 'wrong password')
@@ -1173,7 +1899,8 @@ class WifiTests(unittest.TestCase):
                 ), \
                 mock.patch.object(
                     wifi,
-                    '_enable_profile_autoconnect',
+                    '_ensure_profile_autoconnect',
+                    return_value=(0, '', ''),
                 ) as enable_autoconnect:
             wifi._connect_worker(first_job, net, 'wrong password')
             wifi._connect_worker(retry_job, net, 'correct password')
@@ -1205,7 +1932,7 @@ class WifiTests(unittest.TestCase):
             ],
         )
         restore_autoconnect.assert_called_once_with('uuid-home')
-        enable_autoconnect.assert_not_called()
+        enable_autoconnect.assert_called_once_with('uuid-home')
 
     def test_saved_replacement_blocks_autoconnect_without_exposing_secret(self):
         with mock.patch.object(
@@ -1272,6 +1999,10 @@ class WifiTests(unittest.TestCase):
             events.append('restore')
             return 0, '', ''
 
+        def ensure(*args):
+            events.append('ensure')
+            return 0, '', ''
+
         with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
                 mock.patch.object(
                     wifi,
@@ -1297,11 +2028,19 @@ class WifiTests(unittest.TestCase):
                     wifi,
                     '_restore_saved_autoconnect',
                     side_effect=restore,
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_ensure_profile_autoconnect',
+                    side_effect=ensure,
                 ):
             wifi._connect_worker(job, net, 'replacement')
 
         self.assertTrue(job.ok)
-        self.assertEqual(events, ['prepare', 'activate', 'verify', 'restore'])
+        self.assertEqual(
+            events,
+            ['prepare', 'activate', 'verify', 'restore', 'ensure'],
+        )
         self.assertTrue(net.autoconnect)
 
     def test_saved_replacement_retry_retains_original_autoconnect_preference(self):
@@ -1396,7 +2135,12 @@ class WifiTests(unittest.TestCase):
                     wifi,
                     '_restore_saved_autoconnect',
                     return_value=(0, '', ''),
-                ) as restore:
+                ) as restore, \
+                mock.patch.object(
+                    wifi,
+                    '_ensure_profile_autoconnect',
+                    return_value=(0, '', ''),
+                ):
             wifi._connect_worker(job, net, None)
 
         self.assertTrue(job.ok)
@@ -1478,7 +2222,7 @@ class WifiTests(unittest.TestCase):
                 ), \
                 mock.patch.object(
                     wifi,
-                    '_enable_profile_autoconnect',
+                    '_ensure_profile_autoconnect',
                     side_effect=enable_autoconnect,
                 ):
             wifi._connect_worker(job, net, 'password')
@@ -1522,7 +2266,7 @@ class WifiTests(unittest.TestCase):
                 ), \
                 mock.patch.object(
                     wifi,
-                    '_enable_profile_autoconnect',
+                    '_ensure_profile_autoconnect',
                     return_value=(1, '', 'not authorized'),
                 ):
             wifi._connect_worker(job, net, 'password')
@@ -1590,7 +2334,11 @@ class WifiTests(unittest.TestCase):
                     wifi,
                     '_cancel_activation',
                     return_value=True,
-                ) as cancel:
+                ) as cancel, \
+                mock.patch.object(
+                    wifi,
+                    '_unblock_profile_autoconnect',
+                ) as unblock:
             wifi._connect_worker(job, net, None)
 
         self.assertFalse(job.ok)
@@ -1598,6 +2346,7 @@ class WifiTests(unittest.TestCase):
         self.assertEqual(job.message, 'Authentication timed out')
         self.assertTrue(job.needs_password)
         cancel.assert_called_once_with('uuid-home', 'wlan0')
+        unblock.assert_not_called()
         self.assertIn('uuid-home', wifi._reauth_required)
 
         # If the user closes the password keyboard, another Connect tap must
@@ -1772,6 +2521,11 @@ class WifiTests(unittest.TestCase):
                 ) as verify, \
                 mock.patch.object(
                     wifi,
+                    '_ensure_profile_autoconnect',
+                    return_value=(0, '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
                     '_cancel_activation',
                 ) as cancel:
             wifi._connect_worker(job, net, None)
@@ -1832,13 +2586,131 @@ class WifiTests(unittest.TestCase):
                     wifi,
                     '_cancel_activation',
                     return_value=True,
-                ):
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_unblock_profile_autoconnect',
+                    return_value=(0, '', ''),
+                ) as unblock:
             wifi._connect_worker(job, net, None)
 
         self.assertFalse(job.ok)
         self.assertEqual(job.code, 'dhcp_failed')
         self.assertEqual(job.message, 'Could not obtain IP')
         self.assertFalse(job.needs_password)
+        unblock.assert_called_once_with('uuid-home', enabled=True)
+
+    def test_activation_timeout_surfaces_autoconnect_unblock_failure(self):
+        net = wifi.Network(
+            'Home',
+            security='WPA2',
+            saved=True,
+            iface='wlan0',
+            profile_uuid='uuid-home',
+        )
+        job = wifi.WifiJob('connect', net.ssid)
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({'Home': [profile()]}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    side_effect=[
+                        wifi.ActiveConnection('wlan0', state='30 (disconnected)'),
+                        wifi.ActiveConnection(
+                            'wlan0',
+                            state='70 (connecting)',
+                            uuid='uuid-home',
+                        ),
+                    ],
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_activate_profile',
+                    return_value=(3, '', 'Timeout expired (45 seconds)'),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_verify_connected',
+                    return_value=(False, '', 'No IPv4 address'),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_cancel_activation',
+                    return_value=True,
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_unblock_profile_autoconnect',
+                    return_value=(1, '', 'readback failed'),
+                ) as unblock:
+            wifi._connect_worker(job, net, None)
+
+        unblock.assert_called_once_with('uuid-home', enabled=True)
+        self.assertFalse(job.ok)
+        self.assertEqual(job.code, 'autoconnect_failed')
+        self.assertEqual(
+            job.message,
+            'Could not restore automatic reconnect',
+        )
+
+    def test_activation_cleanup_failure_wins_before_autoconnect_unblock(self):
+        net = wifi.Network(
+            'Home',
+            security='WPA2',
+            saved=True,
+            iface='wlan0',
+            profile_uuid='uuid-home',
+        )
+        job = wifi.WifiJob('connect', net.ssid)
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({'Home': [profile()]}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    side_effect=[
+                        wifi.ActiveConnection('wlan0', state='30 (disconnected)'),
+                        wifi.ActiveConnection(
+                            'wlan0',
+                            state='70 (connecting)',
+                            uuid='uuid-home',
+                        ),
+                    ],
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_activate_profile',
+                    return_value=(3, '', 'Timeout expired (45 seconds)'),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_verify_connected',
+                    return_value=(False, '', 'No IPv4 address'),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_cancel_activation',
+                    return_value=False,
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_unblock_profile_autoconnect',
+                ) as unblock:
+            wifi._connect_worker(job, net, None)
+
+        unblock.assert_not_called()
+        self.assertFalse(job.ok)
+        self.assertEqual(job.code, 'cleanup_failed')
+        self.assertEqual(job.message, 'Could not stop connection attempt')
 
     def test_replacement_password_reaches_ip_and_clears_reauth_requirement(self):
         net = wifi.Network(
@@ -1849,6 +2721,7 @@ class WifiTests(unittest.TestCase):
             profile_uuid='uuid-home',
         )
         wifi._reauth_required.add('uuid-home')
+        wifi._autoconnect_restore['uuid-home'] = True
         job = wifi.WifiJob('connect', net.ssid)
 
         with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
@@ -1893,13 +2766,20 @@ class WifiTests(unittest.TestCase):
                     wifi,
                     '_cancel_activation',
                     return_value=True,
-                ):
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_unblock_profile_autoconnect',
+                    return_value=(0, '', ''),
+                ) as unblock:
             wifi._connect_worker(job, net, 'correct-password')
 
         self.assertFalse(job.ok)
         self.assertEqual(job.code, 'dhcp_failed')
         self.assertFalse(job.needs_password)
         self.assertNotIn('uuid-home', wifi._reauth_required)
+        unblock.assert_called_once_with('uuid-home', enabled=False)
+        self.assertTrue(wifi._autoconnect_restore['uuid-home'])
 
         retry = wifi.WifiJob('connect', net.ssid)
         with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
@@ -1961,7 +2841,11 @@ class WifiTests(unittest.TestCase):
                     wifi,
                     '_cancel_activation',
                     return_value=False,
-                ):
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_supervisor_note_auth_failure',
+                ) as note_auth_failure:
             wifi._connect_worker(job, net, None)
 
         self.assertFalse(job.ok)
@@ -1971,6 +2855,7 @@ class WifiTests(unittest.TestCase):
         self.assertIsNotNone(wifi._recovery_latch)
         self.assertEqual(wifi._recovery_latch.profile_uuid, 'uuid-home')
         self.assertTrue(wifi._recovery_latch.reauth_required)
+        note_auth_failure.assert_not_called()
 
     def test_recovered_timeout_prompts_before_retrying_stale_credentials(self):
         net = wifi.Network(
@@ -2008,6 +2893,164 @@ class WifiTests(unittest.TestCase):
         self.assertEqual(job.code, 'authentication_timeout')
         self.assertTrue(job.needs_password)
         activate.assert_not_called()
+
+    def test_saved_ip_verification_cleanup_unblocks_autoconnect(self):
+        net = wifi.Network(
+            'Home',
+            security='WPA2',
+            saved=True,
+            iface='wlan0',
+            profile_uuid='uuid-home',
+        )
+        job = wifi.WifiJob('connect', net.ssid)
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({'Home': [profile()]}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=wifi.ActiveConnection(
+                        'wlan0',
+                        state='30 (disconnected)',
+                    ),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_activate_profile',
+                    return_value=(0, '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_verify_connected',
+                    return_value=(False, '', 'No IPv4 address'),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_cancel_activation',
+                    return_value=True,
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_unblock_profile_autoconnect',
+                    return_value=(0, '', ''),
+                ) as unblock:
+            wifi._connect_worker(job, net, None)
+
+        unblock.assert_called_once_with('uuid-home', enabled=True)
+        self.assertFalse(job.ok)
+        self.assertEqual(job.code, 'dhcp_failed')
+
+    def test_saved_ip_verification_surfaces_autoconnect_unblock_failure(self):
+        net = wifi.Network(
+            'Home',
+            security='WPA2',
+            saved=True,
+            iface='wlan0',
+            profile_uuid='uuid-home',
+        )
+        job = wifi.WifiJob('connect', net.ssid)
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({'Home': [profile()]}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=wifi.ActiveConnection(
+                        'wlan0',
+                        state='30 (disconnected)',
+                    ),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_activate_profile',
+                    return_value=(0, '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_verify_connected',
+                    return_value=(False, '', 'No IPv4 address'),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_cancel_activation',
+                    return_value=True,
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_unblock_profile_autoconnect',
+                    return_value=(1, '', 'readback failed'),
+                ):
+            wifi._connect_worker(job, net, None)
+
+        self.assertFalse(job.ok)
+        self.assertEqual(job.code, 'autoconnect_failed')
+        self.assertEqual(
+            job.message,
+            'Could not restore automatic reconnect',
+        )
+
+    def test_saved_ip_verification_cleanup_failure_is_not_hidden(self):
+        net = wifi.Network(
+            'Home',
+            security='WPA2',
+            saved=True,
+            iface='wlan0',
+            profile_uuid='uuid-home',
+        )
+        job = wifi.WifiJob('connect', net.ssid)
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({'Home': [profile()]}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=wifi.ActiveConnection(
+                        'wlan0',
+                        state='30 (disconnected)',
+                    ),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_activate_profile',
+                    return_value=(0, '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_verify_connected',
+                    return_value=(False, '', 'No IPv4 address'),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_cancel_activation',
+                    return_value=False,
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_wait_activation_stopped',
+                    return_value=False,
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_unblock_profile_autoconnect',
+                ) as unblock:
+            wifi._connect_worker(job, net, None)
+
+        unblock.assert_not_called()
+        self.assertFalse(job.ok)
+        self.assertEqual(job.code, 'cleanup_failed')
+        self.assertEqual(job.message, 'Could not stop connection attempt')
 
     def test_failed_ip_verification_cancels_and_discards_new_profile(self):
         net = wifi.Network('Home', security='WPA2', iface='wlan0')
@@ -2049,13 +3092,18 @@ class WifiTests(unittest.TestCase):
                     wifi,
                     '_discard_new_profile',
                     return_value=True,
-                ) as discard:
+                ) as discard, \
+                mock.patch.object(
+                    wifi,
+                    '_unblock_profile_autoconnect',
+                ) as unblock:
             wifi._connect_worker(job, net, 'password')
 
         self.assertFalse(job.ok)
         self.assertEqual(job.code, 'dhcp_failed')
         cancel.assert_called_once_with('uuid-new', 'wlan0')
         discard.assert_called_once_with(net, 'uuid-new')
+        unblock.assert_not_called()
 
     def test_enterprise_and_wep_networks_are_unsupported(self):
         self.assertFalse(wifi.Network('Corp', security='WPA2 802.1X').supported)

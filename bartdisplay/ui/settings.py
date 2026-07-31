@@ -10,6 +10,7 @@ to create the pull-down effect.
 """
 
 import threading
+import time
 
 import pygame
 
@@ -50,7 +51,15 @@ class SettingsPanel:
         self.action_job = None
         self.status = ''
         self.status_kind = 'info'       # info | success | error
-        self._after_scan_message = ''
+        self.scan_summary = ''
+        self.scan_summary_kind = 'info'
+        self.last_scan_completed_at = 0.0
+        self._supervisor_sequence = 0
+        self._supervisor_notice = ''
+        self._supervisor_notice_kind = 'info'
+        self._supervisor_notice_profile_uuid = ''
+        self._supervisor_notice_ssid = ''
+        self._supervisor_notice_phase = ''
         self.scroll = 0
         self._scrollbar_dragging = False
         self._scrollbar_drag_offset = 0
@@ -76,15 +85,23 @@ class SettingsPanel:
             self._scrollbar_dragging = False
 
     def _goto(self, view):
-        previous = self.view
         self.view = view
         self.status = ''
         self.status_kind = 'info'
         self._scrollbar_dragging = False
-        if view == 'wifi' and previous != 'wifi_detail':
-            # Entering the list reads NetworkManager's existing AP cache.
-            # A hardware rescan happens only when the user taps RESCAN.
-            self._start_scan(rescan=False)
+        if view == 'wifi':
+            # The list is intentionally stable until the user requests a scan.
+            # Restore the latest scan summary when returning from network detail.
+            self.status = self._supervisor_notice or self.scan_summary or (
+                'Press Rescan to update nearby networks'
+                if self.networks
+                else 'Press Rescan to find nearby networks'
+            )
+            self.status_kind = (
+                self._supervisor_notice_kind
+                if self._supervisor_notice
+                else self.scan_summary_kind
+            )
         if view == 'apikey':
             self.api_saved = False
 
@@ -95,14 +112,212 @@ class SettingsPanel:
             or (self.action_job is not None and not self.action_job.done)
         )
 
-    def _start_scan(self, after_message='', rescan=True):
-        if self._wifi_busy():
+    def _wifi_mutation_busy(self):
+        return (
+            self._wifi_busy()
+            or wifi.connection_supervisor_recovery_busy()
+        )
+
+    def _start_scan(self):
+        if self._wifi_mutation_busy():
             return
-        self.scan_job = wifi.scan_async(rescan=rescan)
-        self._after_scan_message = after_message
-        self.status = 'Scanning...' if rescan else 'Refreshing...'
+        # This is called only by the explicit RESCAN control. Do not add
+        # implicit list-entry or post-action refreshes here.
+        self.scan_job = wifi.scan_async(rescan=True)
+        self.status = 'Scanning...'
         self.scan_job.set_status(self.status)
         self.status_kind = 'info'
+
+    @staticmethod
+    def _network_detected(net):
+        """Whether this row represents an access point detected right now."""
+        return bool(getattr(
+            net,
+            'detected',
+            not getattr(net, 'stale', False),
+        ))
+
+    @classmethod
+    def _network_signal_is_current(cls, net):
+        return (
+            cls._network_detected(net)
+            and not bool(getattr(net, 'stale', False))
+        )
+
+    @classmethod
+    def _network_row_state(cls, net):
+        """Return the row tag and whether current signal bars are meaningful."""
+        if getattr(net, 'active', False):
+            return 'ONLINE', cls._network_signal_is_current(net)
+        if getattr(net, 'saved', False) and not cls._network_detected(net):
+            return 'NOT DETECTED', False
+        if getattr(net, 'stale', False):
+            return 'RECENT', False
+        if not cls._network_detected(net):
+            return 'NOT DETECTED', False
+        if getattr(net, 'saved', False):
+            return 'SAVED', True
+        return '', True
+
+    @staticmethod
+    def _scan_time_label(completed_at):
+        if not completed_at:
+            return ''
+        return time.strftime(
+            '%I:%M %p',
+            time.localtime(completed_at),
+        ).lstrip('0')
+
+    @classmethod
+    def _scan_result_summary(cls, networks, completed_at=0.0):
+        detected = sum(
+            1 for net in networks
+            if cls._network_signal_is_current(net)
+        )
+        recent = sum(
+            1 for net in networks
+            if getattr(net, 'stale', False)
+            and not getattr(net, 'active', False)
+        )
+        saved_missing = sum(
+            1 for net in networks
+            if getattr(net, 'saved', False)
+            and not cls._network_detected(net)
+            and not getattr(net, 'stale', False)
+            and not getattr(net, 'active', False)
+        )
+        parts = [f'{detected} detected']
+        if recent:
+            parts.append(f'{recent} recent')
+        if saved_missing:
+            parts.append(f'{saved_missing} saved not detected')
+        summary = ', '.join(parts)
+        completed_label = cls._scan_time_label(completed_at)
+        return (
+            f'{summary} @ {completed_label}'
+            if completed_label
+            else summary
+        )
+
+    @classmethod
+    def _sanitize_network_info(cls, net, rows):
+        if cls._network_signal_is_current(net):
+            return rows
+        availability = (
+            'Recent result'
+            if getattr(net, 'stale', False)
+            else 'Not detected'
+        )
+        result = []
+        for label, value in rows:
+            if label == 'SIGNAL':
+                result.append(('AVAILABILITY', availability))
+            else:
+                result.append((label, value))
+        return result
+
+    @classmethod
+    def _basic_network_info(cls, net):
+        return cls._sanitize_network_info(net, wifi.info_basic(net))
+
+    @staticmethod
+    def _matching_networks(networks, profile_uuid='', ssid=''):
+        """Resolve a snapshot identity by UUID, then by SSID if necessary."""
+        uuid_matches = [
+            network for network in networks
+            if (
+                profile_uuid
+                and getattr(network, 'profile_uuid', '') == profile_uuid
+            )
+        ]
+        if uuid_matches:
+            return uuid_matches
+        if not ssid:
+            return []
+        # A UUID-bearing snapshot may use SSID only to resolve rows whose
+        # profile lookup was incomplete. Never override a conflicting UUID.
+        if profile_uuid:
+            return [
+                network for network in networks
+                if (
+                    getattr(network, 'ssid', '') == ssid
+                    and not getattr(network, 'profile_uuid', '')
+                )
+            ]
+        return [
+            network for network in networks
+            if getattr(network, 'ssid', '') == ssid
+        ]
+
+    def _clear_supervisor_notice(self):
+        self._supervisor_notice = ''
+        self._supervisor_notice_kind = 'info'
+        self._supervisor_notice_profile_uuid = ''
+        self._supervisor_notice_ssid = ''
+        self._supervisor_notice_phase = ''
+
+    def _supervisor_notice_applies_to(self, net):
+        if not self._supervisor_notice:
+            return False
+        net_uuid = getattr(net, 'profile_uuid', '')
+        if self._supervisor_notice_profile_uuid and net_uuid:
+            return net_uuid == self._supervisor_notice_profile_uuid
+        if self._supervisor_notice_ssid:
+            return (
+                getattr(net, 'ssid', '')
+                == self._supervisor_notice_ssid
+            )
+        if self._supervisor_notice_phase == 'disconnected':
+            return False
+        return True
+
+    def _refresh_detail_info(self, net):
+        """Refresh selected detail rows and invalidate any older worker."""
+        self._detail_request_id += 1
+        request_id = self._detail_request_id
+        self.detail_info = self._basic_network_info(net)
+        if not net.active:
+            return
+
+        def work():
+            info = self._sanitize_network_info(net, wifi.info(net))
+            if (
+                    self._detail_request_id == request_id
+                    and self.selected is net
+                    and self.view == 'wifi_detail'):
+                self.detail_info = info
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_empty_scan_result(self):
+        return (
+            not self.networks
+            and self.scan_job is None
+            and bool(self.last_scan_completed_at)
+        )
+
+    @staticmethod
+    def _downgrade_retained_networks(networks):
+        """Keep actionable identities without presenting expired scan data."""
+        retained = []
+        for network in networks:
+            if not (
+                    getattr(network, 'saved', False)
+                    or getattr(network, 'active', False)):
+                continue
+            for field, value in (
+                    ('detected', False),
+                    ('stale', False),
+                    ('signal', 0),
+                    ('security', ''),
+                    ('protected', False),
+                    ('bssid', ''),
+                    ('last_seen', 0.0),
+                    ('in_use', False)):
+                if hasattr(network, field):
+                    setattr(network, field, value)
+            retained.append(network)
+        return retained
 
     def _update_wifi_jobs(self):
         if self.scan_job is not None:
@@ -111,30 +326,50 @@ class SettingsPanel:
             self.status_kind = 'info'
             if job.done:
                 self.scan_job = None
-                if job.networks or job.ok:
-                    self.networks = job.networks
+                if job.completed_at:
+                    self.last_scan_completed_at = job.completed_at
+                # The backend returns bounded-TTL recent rows when they remain
+                # valid. A zero completion time means the operation gate
+                # rejected the request before scanning, so retain the list
+                # unchanged. An attempted empty failure expires ordinary AP
+                # rows while preserving saved/active identities without scan
+                # claims.
+                preflight_failure = (
+                    not job.ok
+                    and not job.networks
+                    and not job.completed_at
+                    and job.code in ('busy', 'cleanup_pending')
+                )
+                if not preflight_failure:
+                    self.networks = (
+                        job.networks
+                        if job.ok or job.networks
+                        else self._downgrade_retained_networks(self.networks)
+                    )
                     self._clamp_scroll()
-                after_message = self._after_scan_message
-                self._after_scan_message = ''
                 if not job.ok:
-                    self.status = (
-                        f'{after_message} - {job.message}'
-                        if after_message and job.message
-                        else (after_message or job.message)
+                    counts = self._scan_result_summary(
+                        self.networks,
+                        self.last_scan_completed_at,
                     )
+                    message = job.message or 'Scan failed'
+                    self.scan_summary = f'{counts}; {message}'
+                    self.scan_summary_kind = 'error'
+                    self.status = self.scan_summary
                     self.status_kind = 'error'
-                elif after_message:
-                    self.status = (
-                        f'{after_message} - {job.message}'
-                        if job.message
-                        else after_message
-                    )
-                    self.status_kind = 'info' if job.partial else 'success'
-                elif job.message:
-                    self.status = job.message
-                    self.status_kind = 'info'
                 else:
-                    self.status = ''
+                    counts = self._scan_result_summary(
+                        job.networks,
+                        self.last_scan_completed_at,
+                    )
+                    self.scan_summary = (
+                        f'{counts}; {job.message}'
+                        if job.message
+                        else counts
+                    )
+                    self.scan_summary_kind = 'info'
+                    self.status = self.scan_summary
+                    self.status_kind = 'info'
 
         if self.action_job is not None:
             job = self.action_job
@@ -145,14 +380,21 @@ class SettingsPanel:
 
             self.action_job = None
             if job.ok:
-                if job.kind == 'disconnect':
-                    for network in self.networks:
-                        if network.ssid == job.ssid:
-                            network.active = False
+                for network in self.networks:
+                    if job.kind == 'connect':
+                        network.active = network.ssid == job.ssid
+                        if network.active:
+                            network.saved = True
+                    elif (
+                            job.kind == 'disconnect'
+                            and network.ssid == job.ssid):
+                        network.active = False
                 self.selected = None
                 self.detail_info = []
                 self.view = 'wifi'
-                self._start_scan(after_message=job.message, rescan=False)
+                self._clear_supervisor_notice()
+                self.status = job.message
+                self.status_kind = 'success'
                 return
 
             self.status = job.message
@@ -170,6 +412,112 @@ class SettingsPanel:
                     on_submit=self._connect_with_password,
                 )
 
+    def _update_connection_supervisor(self):
+        """Apply a new background connection event without fighting UI jobs."""
+        snapshot = wifi.connection_supervisor_snapshot()
+        if snapshot.sequence <= self._supervisor_sequence:
+            return
+        if (
+                (self.scan_job is not None and not self.scan_job.done)
+                or (self.action_job is not None and not self.action_job.done)):
+            # Keep foreground progress visible. The unconsumed sequence will be
+            # applied on the next frame after the foreground operation finishes.
+            return
+
+        self._supervisor_sequence = snapshot.sequence
+        detail_needs_refresh = False
+        if snapshot.active_uuid:
+            matches = self._matching_networks(
+                self.networks,
+                profile_uuid=snapshot.active_uuid,
+                ssid=snapshot.ssid,
+            )
+            # Do not clear a known-active row if this retained list cannot yet
+            # resolve the supervisor's identity.
+            if matches:
+                for network in self.networks:
+                    was_active = network.active
+                    network.active = network in matches
+                    if network.active:
+                        network.saved = True
+                    if self.selected is network and (
+                            was_active != network.active
+                            or (
+                                network.active
+                                and snapshot.phase in (
+                                    'connected',
+                                    'reconnected',
+                                )
+                            )):
+                        detail_needs_refresh = True
+        elif snapshot.phase == 'disconnected':
+            for network in self.networks:
+                if self.selected is network and network.active:
+                    detail_needs_refresh = True
+                network.active = False
+        elif snapshot.phase in (
+                'grace',
+                'recovering',
+                'attention',
+                'failed',
+        ):
+            matches = self._matching_networks(
+                self.networks,
+                profile_uuid=snapshot.profile_uuid,
+                ssid=snapshot.ssid,
+            )
+            for network in matches:
+                if self.selected is network and network.active:
+                    detail_needs_refresh = True
+                if network.active:
+                    network.active = False
+
+        if (
+                detail_needs_refresh
+                and self.selected is not None
+                and self.view == 'wifi_detail'):
+            self._refresh_detail_info(self.selected)
+
+        kinds = {
+            'grace': 'info',
+            'recovering': 'info',
+            'reconnected': 'success',
+            'attention': 'error',
+            'failed': 'error',
+            'disconnected': 'info',
+        }
+        if snapshot.phase not in kinds:
+            if snapshot.phase == 'connected':
+                previous_notice = self._supervisor_notice
+                previous_kind = self._supervisor_notice_kind
+                self._clear_supervisor_notice()
+                if (
+                        previous_notice
+                        and self.view in ('wifi', 'wifi_detail')
+                        and self.status == previous_notice
+                        and self.status_kind == previous_kind):
+                    if self.view == 'wifi' and self.scan_summary:
+                        self.status = self.scan_summary
+                        self.status_kind = self.scan_summary_kind
+                    else:
+                        self.status = (
+                            snapshot.message
+                            or 'Wi-Fi connected'
+                        )
+                        self.status_kind = 'success'
+            return
+
+        self._supervisor_notice = snapshot.message
+        self._supervisor_notice_kind = kinds[snapshot.phase]
+        self._supervisor_notice_profile_uuid = (
+            snapshot.profile_uuid or snapshot.active_uuid
+        )
+        self._supervisor_notice_ssid = snapshot.ssid
+        self._supervisor_notice_phase = snapshot.phase
+        if self.view in ('wifi', 'wifi_detail'):
+            self.status = snapshot.message
+            self.status_kind = kinds[snapshot.phase]
+
     # -- per-frame update ---------------------------------------------------
     def update(self, dt_ms):
         speed = H / _SLIDE_SEC
@@ -186,6 +534,7 @@ class SettingsPanel:
                 self.state = 'CLOSED'
 
         self._update_wifi_jobs()
+        self._update_connection_supervisor()
 
     def animating(self):
         return self.state in ('OPENING', 'CLOSING')
@@ -412,8 +761,9 @@ class SettingsPanel:
     def _render_wifi(self):
         btns = self._header('WI-FI', back_to='menu')
         rescan = Button((W - PAD - 116, 5, 116, 26), 'RESCAN',
-                        on_tap=lambda _b: self._start_scan(), font=display.font_xs,
-                        enabled=not self._wifi_busy())
+                        on_tap=lambda _b: self._start_scan(),
+                        font=display.font_xs,
+                        enabled=not self._wifi_mutation_busy())
         rescan.draw()
         btns.append(rescan)
 
@@ -440,7 +790,7 @@ class SettingsPanel:
         self._surf.set_clip(None)
         btns += self._render_scrollbar()
 
-        if not self.networks and self.scan_job is None:
+        if self._show_empty_scan_result():
             display.blit_center(
                 'No networks found',
                 display.font_xs,
@@ -503,17 +853,27 @@ class SettingsPanel:
             color=C['ghost'],
         )
 
-        name_color = C['arrive'] if net.active else C['on']
+        tag, show_signal = self._network_row_state(net)
+        name_color = (
+            C['arrive']
+            if net.active
+            else (C['on'] if show_signal else C['ghost'])
+        )
         # right-side cluster: signal bars, lock, saved/active tag
         right = _LIST_RIGHT - PAD
-        bars_w = 4 * 8
-        signal_x = right - bars_w
-        draw_signal_bars(signal_x, y + _ROW_H // 2 + 8, net.signal, active=net.active)
-        right = signal_x - 8
+        if show_signal:
+            bars_w = 4 * 8
+            signal_x = right - bars_w
+            draw_signal_bars(
+                signal_x,
+                y + _ROW_H // 2 + 8,
+                net.signal,
+                active=net.active,
+            )
+            right = signal_x - 8
         if net.protected:
             draw_lock(right - 12, y + 10)
             right -= 18
-        tag = 'ONLINE' if net.active else ('SAVED' if net.saved else '')
         if tag:
             tw = draw_tag(tag, right, y + 8,
                           bg=(C['ok'] if net.active else C['dim']))
@@ -532,22 +892,23 @@ class SettingsPanel:
 
     def _select(self, net):
         self.selected = net
-        self.status = ''
+        if self._supervisor_notice_applies_to(net):
+            self.status = self._supervisor_notice
+            self.status_kind = self._supervisor_notice_kind
+        elif not self._network_signal_is_current(net):
+            self.status = (
+                'Recent result. Press Rescan.'
+                if getattr(net, 'stale', False)
+                else 'Not detected. Press Rescan.'
+            )
+            self.status_kind = 'info'
+        else:
+            self.status = ''
+            self.status_kind = 'info'
         self.view = 'wifi_detail'
-        self._detail_request_id += 1
-        request_id = self._detail_request_id
         # Show the cheap rows immediately; fetch IP/gateway (nmcli) off-thread
         # so the detail render never spawns subprocesses per frame.
-        self.detail_info = wifi.info_basic(net)
-        if net.active:
-            def work():
-                info = wifi.info(net)
-                if (
-                        self._detail_request_id == request_id
-                        and self.selected is net
-                        and self.view == 'wifi_detail'):
-                    self.detail_info = info
-            threading.Thread(target=work, daemon=True).start()
+        self._refresh_detail_info(net)
 
     # -- Wi-Fi detail -------------------------------------------------------
     def _render_wifi_detail(self):
@@ -602,15 +963,18 @@ class SettingsPanel:
             )
 
         busy = self._wifi_busy()
+        mutation_busy = self._wifi_mutation_busy()
         action_kind = self.action_job.kind if self.action_job is not None else ''
         if net.active:
             label = 'DISCONNECTING...' if action_kind == 'disconnect' else 'DISCONNECT'
             act = Button((PAD, by, bw, 30), label,
                          on_tap=lambda _b: self._do_disconnect(), font=display.font_xs,
-                         enabled=not busy)
+                         enabled=not mutation_busy)
         else:
             if not net.supported:
                 label = 'UNSUPPORTED'
+            elif not self._network_signal_is_current(net):
+                label = 'NOT DETECTED'
             elif action_kind == 'connect':
                 label = 'CONNECTING...'
             else:
@@ -618,7 +982,11 @@ class SettingsPanel:
             act = Button((PAD, by, bw, 30),
                          label,
                          on_tap=lambda _b: self._do_connect(), font=display.font_xs,
-                         enabled=not busy and net.supported)
+                         enabled=(
+                             not mutation_busy
+                             and net.supported
+                             and self._network_signal_is_current(net)
+                         ))
         back = Button((PAD + bw + 10, by, bw, 30), 'BACK',
                       on_tap=lambda _b: self._goto('wifi'), font=display.font_xs,
                       enabled=not busy)
@@ -651,10 +1019,14 @@ class SettingsPanel:
         return C['on']
 
     def _do_connect(self):
-        if self._wifi_busy():
+        if self._wifi_mutation_busy():
             return
         net = self.selected
         if net is None:
+            return
+        if not self._network_signal_is_current(net):
+            self.status = 'Not detected. Press Rescan.'
+            self.status_kind = 'error'
             return
         if not net.supported:
             self.status = 'Unsupported network security'
@@ -673,9 +1045,13 @@ class SettingsPanel:
             self.status_kind = 'info'
 
     def _connect_with_password(self, password):
-        self.keyboard = None
         if self.selected is None:
             return
+        if self._wifi_mutation_busy():
+            self.status = 'Wi-Fi recovery in progress. Try again shortly.'
+            self.status_kind = 'info'
+            return
+        self.keyboard = None
         if not password:
             self.status = 'Password required'
             self.status_kind = 'error'
@@ -685,7 +1061,7 @@ class SettingsPanel:
         self.status_kind = 'info'
 
     def _do_disconnect(self):
-        if self._wifi_busy():
+        if self._wifi_mutation_busy():
             return
         net = self.selected
         if net is None:
