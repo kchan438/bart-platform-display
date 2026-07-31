@@ -1,6 +1,6 @@
 [Unit]
 Description=BART Platform Display
-After=network-online.target bart-platform-display-splash.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
