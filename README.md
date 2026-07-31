@@ -25,6 +25,7 @@ bart-platform-display/
 │   ├── board.py                    # main departure-board render
 │   ├── touch.py                    # XPT2046 evdev reader + gesture recognizer
 │   ├── wifi.py                     # nmcli wrapper (scan/connect/disconnect/info)
+│   ├── updater.py                  # safe async origin/main fast-forward updates
 │   ├── system_control.py           # async systemd-logind D-Bus reboot request
 │   └── ui/                         # swipe-down settings panel
 │       ├── widgets.py              # buttons + icon helpers
@@ -70,11 +71,58 @@ The device is configured entirely from the touchscreen — no SSH needed:
   and **Save** writes it to `config.json`. A new key applies on the next poll
   (~30 s) without a restart. After saving, **Open System Restart** links to the
   shared service restart control when an immediate reload is wanted.
-- **System**: offers two deliberately separate, confirmation-protected actions:
-  **Restart Display Service** cleanly exits only this app so systemd relaunches
-  it, while **Restart Raspberry Pi** requests a normal full-device reboot.
-  Duplicate taps are disabled once an action is dispatched, and immediate
-  authorization or command failures remain visible on screen.
+- **System**: **Update App** downloads the latest `origin/main` only while
+  Wi-Fi is connected. The operation runs in the background and reports whether
+  the app changed, was already current, or failed with a short explanation.
+  The same screen offers two deliberately separate, confirmation-protected
+  actions: **Restart Display Service** cleanly exits only this app so systemd
+  relaunches it, while **Restart Raspberry Pi** requests a normal full-device
+  reboot. Duplicate taps are disabled while an update or restart is active,
+  and immediate failures remain visible on screen.
+
+### On-device app updates (Git)
+
+**Settings → System → Update App** runs this narrow update from the application
+checkout:
+
+```bash
+git pull --ff-only origin main
+```
+
+The updater:
+
+- requires the device checkout to be on `main` with no tracked source changes;
+- permits only the normal unstaged `config.json` change created by touchscreen
+  settings, while relying on Git to refuse an update that would overwrite it;
+- uses the existing `origin` remote and never embeds a token or credential;
+- disables Git terminal and credential-manager prompts;
+- refuses merge commits, diverged history, stashing, resets, cleans, and force
+  operations;
+- verifies the running branch exactly matches the fetched `origin/main` commit;
+- runs off the pygame thread with a bounded timeout; and
+- reports **Already up to date**, a successful update requiring a display
+  restart, or a short categorized error.
+
+Downloaded Python files do not replace modules already loaded by the running
+process. After a changed update, press **Restart Display to Apply** and confirm
+the service-only restart. The Raspberry Pi does not need to reboot.
+
+No PolicyKit or `sudo` permission is needed. Git runs as the existing
+`kevinchan` service user. This repository's public HTTPS remote needs no
+credentials for read access. If the repository becomes private, configure a
+non-interactive Git credential for that same service user; an interactive
+`gh auth login` alone must not be assumed to make systemd Git operations work.
+
+Validate the deployed checkout and non-interactive remote access before relying
+on the touchscreen update:
+
+```bash
+sudo -u kevinchan git -C /home/kevinchan/bart-platform-display \
+  status --short --branch
+sudo -u kevinchan env GIT_TERMINAL_PROMPT=0 \
+  git -C /home/kevinchan/bart-platform-display \
+  ls-remote origin refs/heads/main
+```
 
 ### Wi-Fi permissions (NetworkManager)
 
@@ -363,6 +411,10 @@ sudo systemctl restart bart-platform-display
 | Display stays white, `dd if=/dev/zero of=/dev/fb0` has no effect | fbcon is still active and overwriting the framebuffer — confirm `fbcon=map:10` is in `/boot/firmware/cmdline.txt` |
 | `Font not found` error | Place `PressStart2P-Regular.ttf` in `fonts/` |
 | `LOADING...` stays forever | Check internet; run `journalctl -u bart-platform-display -f` for errors |
+| Update App is disabled | Connect to Wi-Fi. Updates are intentionally unavailable in desktop development mode. |
+| Update reports `Update setup is incomplete` | Confirm Git is installed and `/home/kevinchan/bart-platform-display` is on `main` with an `origin` remote and remote `main` branch. |
+| Update reports `GitHub authentication failed` | Verify non-interactive read access as the `kevinchan` service user; do not place a token in the remote URL. |
+| Update reports local changes or cannot fast-forward | Inspect the checkout over SSH. Commit or intentionally remove the device-only work elsewhere; the touchscreen updater never stashes, resets, cleans, or resolves history. |
 | Wi-Fi action shows `Not authorized` | Reinstall the scoped PolicyKit rule above and confirm the required `nmcli general permissions` rows report `yes` |
 | A correct Wi-Fi password still times out | Run `journalctl -u bart-platform-display -u NetworkManager --since "-5 minutes" --no-pager` and inspect the terminal NetworkManager reason |
 | Wi-Fi disconnects after a successful connection | Run `journalctl -u bart-platform-display -u NetworkManager --since "-30 minutes" --no-pager`. The continuous supervisor records sanitized `phase`, error `code`, and NetworkManager reason number; manual scans also record `[wifi] device=... state=... reason=... active_profile=... autoconnect_off=...`. These lines exclude SSIDs, profile names, UUIDs, and passwords. |

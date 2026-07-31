@@ -3,7 +3,7 @@ import types
 import unittest
 from unittest import mock
 
-from bartdisplay import wifi
+from bartdisplay import updater, wifi
 
 
 # The Windows verification interpreter does not include pygame. SettingsPanel's
@@ -215,6 +215,130 @@ class WifiUiStateTests(unittest.TestCase):
         self.assertEqual(panel.system_dispatch_target, 'service')
         self.assertEqual(panel.system_dispatch_delay_ms, delay)
 
+    def test_update_requires_a_connected_wifi_snapshot(self):
+        panel = SettingsPanel()
+        disconnected = wifi.ConnectionStatus(
+            phase='disconnected',
+            code='user_disconnected',
+        )
+
+        with (
+                mock.patch.object(
+                    wifi,
+                    'connection_supervisor_snapshot',
+                    return_value=disconnected,
+                ),
+                mock.patch.object(
+                    updater,
+                    'update_async',
+                ) as update_async):
+            panel._start_update()
+
+        update_async.assert_not_called()
+        self.assertIsNone(panel.update_job)
+        self.assertEqual(
+            panel.update_status,
+            'Connect to Wi-Fi before updating.',
+        )
+        self.assertEqual(panel.update_status_kind, 'error')
+
+    def test_connected_update_starts_once_and_stays_nonblocking(self):
+        panel = SettingsPanel()
+        connected = wifi.ConnectionStatus(
+            phase='connected',
+            code='connected',
+            active_uuid='uuid-home',
+        )
+        job = types.SimpleNamespace(
+            status='Checking for updates...',
+            message='',
+            done=False,
+            ok=False,
+            changed=False,
+        )
+
+        with (
+                mock.patch.object(
+                    wifi,
+                    'connection_supervisor_snapshot',
+                    return_value=connected,
+                ),
+                mock.patch.object(
+                    updater,
+                    'update_async',
+                    return_value=job,
+                ) as update_async):
+            panel._start_update()
+            panel._start_update()
+
+        update_async.assert_called_once_with()
+        self.assertIs(panel.update_job, job)
+        self.assertEqual(panel.update_status, 'Checking for updates...')
+        self.assertEqual(panel.update_status_kind, 'info')
+
+    def test_changed_update_exposes_restart_to_apply(self):
+        panel = SettingsPanel()
+        panel.update_job = types.SimpleNamespace(
+            status='App updated successfully. Restart display to apply.',
+            message='App updated successfully. Restart display to apply.',
+            done=True,
+            ok=True,
+            changed=True,
+        )
+
+        panel._update_app_job()
+
+        self.assertIsNone(panel.update_job)
+        self.assertTrue(panel.update_restart_required)
+        self.assertEqual(panel.update_status_kind, 'success')
+        self.assertEqual(
+            panel.update_status,
+            'App updated successfully. Restart display to apply.',
+        )
+
+    def test_failed_update_remains_visible_and_retryable(self):
+        panel = SettingsPanel()
+        panel.update_job = types.SimpleNamespace(
+            status='Could not reach GitHub.',
+            message='Could not reach GitHub.',
+            done=True,
+            ok=False,
+            changed=False,
+        )
+
+        panel._update_app_job()
+
+        self.assertIsNone(panel.update_job)
+        self.assertFalse(panel.update_restart_required)
+        self.assertEqual(panel.update_status_kind, 'error')
+        self.assertEqual(panel.update_status, 'Could not reach GitHub.')
+        self.assertFalse(panel._update_busy())
+
+    def test_later_current_check_keeps_restart_requirement(self):
+        panel = SettingsPanel()
+        panel.update_restart_required = True
+        panel.update_job = types.SimpleNamespace(
+            status='Already up to date.',
+            message='Already up to date.',
+            done=True,
+            ok=True,
+            changed=False,
+        )
+
+        panel._update_app_job()
+
+        self.assertTrue(panel.update_restart_required)
+        self.assertEqual(panel.update_status, 'Already up to date.')
+
+    def test_restart_confirmation_is_blocked_during_update(self):
+        panel = SettingsPanel()
+        panel.update_job = types.SimpleNamespace(done=False)
+
+        panel._begin_system_confirmation('service')
+
+        self.assertEqual(panel.system_state, 'idle')
+        self.assertEqual(panel.system_confirm_target, '')
+
     def test_upward_swipe_cannot_close_during_system_action(self):
         panel = SettingsPanel()
         panel.state = 'OPEN'
@@ -228,6 +352,21 @@ class WifiUiStateTests(unittest.TestCase):
         })
 
         self.assertEqual(panel.state, 'OPEN')
+
+    def test_update_keeps_system_panel_open_until_git_finishes(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'system'
+        panel.update_job = types.SimpleNamespace(done=False)
+
+        panel.handle({
+            'kind': 'release',
+            'swipe': 'up',
+            'start_y': 200,
+        })
+
+        self.assertEqual(panel.state, 'OPEN')
+        self.assertTrue(panel._update_busy())
 
     def test_system_view_renders_two_distinct_restart_buttons(self):
         panel = SettingsPanel()
@@ -271,11 +410,18 @@ class WifiUiStateTests(unittest.TestCase):
         self.assertEqual(
             [button.label for button in buttons],
             [
+                'UPDATE APP',
                 'RESTART DISPLAY SERVICE',
                 'RESTART RASPBERRY PI',
             ],
         )
-        service_rect, device_rect = [button.rect for button in buttons]
+        update_rect, service_rect, device_rect = [
+            button.rect for button in buttons
+        ]
+        self.assertLess(
+            update_rect[1] + update_rect[3],
+            service_rect[1],
+        )
         self.assertLess(
             service_rect[1] + service_rect[3],
             device_rect[1],
@@ -328,7 +474,114 @@ class WifiUiStateTests(unittest.TestCase):
             button for button in buttons
             if button.label == 'RESTART RASPBERRY PI'
         )
+        update = next(
+            button for button in buttons
+            if button.label == 'UPDATE APP'
+        )
+        self.assertFalse(update.enabled)
         self.assertFalse(device.enabled)
+
+    def test_system_view_explains_restart_is_blocked_by_update(self):
+        panel = SettingsPanel()
+        panel.view = 'system'
+        panel.update_job = types.SimpleNamespace(done=False)
+        rendered_text = []
+
+        class RecordingButton:
+            def __init__(self, rect, label, **kwargs):
+                self.label = label
+                self.enabled = kwargs.get('enabled', True)
+
+            def draw(self):
+                pass
+
+        with (
+                mock.patch.object(
+                    settings_module,
+                    'Button',
+                    RecordingButton,
+                ),
+                mock.patch.object(
+                    panel,
+                    '_header',
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    settings_module.display,
+                    'DEV',
+                    False,
+                ),
+                mock.patch.object(
+                    settings_module.display,
+                    'blit_center',
+                    side_effect=lambda text, *args, **kwargs:
+                    rendered_text.append(text),
+                    create=True,
+                ),
+                mock.patch.object(
+                    settings_module.display,
+                    'font_xs',
+                    object(),
+                    create=True,
+                )):
+            panel._render_system()
+
+        self.assertIn('Update in progress.', rendered_text)
+        self.assertNotIn('Unavailable in dev mode.', rendered_text)
+
+    def test_system_view_enables_update_only_when_wifi_is_connected(self):
+        panel = SettingsPanel()
+        buttons = []
+
+        class RecordingButton:
+            def __init__(self, rect, label, **kwargs):
+                self.label = label
+                self.enabled = kwargs.get('enabled', True)
+                buttons.append(self)
+
+            def draw(self):
+                pass
+
+        connected = wifi.ConnectionStatus(
+            phase='connected',
+            code='connected',
+            active_uuid='uuid-home',
+        )
+        with (
+                mock.patch.object(
+                    settings_module,
+                    'Button',
+                    RecordingButton,
+                ),
+                mock.patch.object(
+                    panel,
+                    '_header',
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    wifi,
+                    'connection_supervisor_snapshot',
+                    return_value=connected,
+                ),
+                mock.patch.object(
+                    settings_module.display,
+                    'blit_center',
+                    return_value=None,
+                    create=True,
+                ),
+                mock.patch.object(
+                    settings_module.display,
+                    'font_xs',
+                    object(),
+                    create=True,
+                )):
+            panel._render_system()
+
+        update = next(
+            button for button in buttons
+            if button.label == 'UPDATE APP'
+        )
+        self.assertTrue(update.enabled)
 
     def test_scrollbar_drag_release_does_not_close_panel(self):
         panel = SettingsPanel()

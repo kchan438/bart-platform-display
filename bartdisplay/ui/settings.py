@@ -14,7 +14,7 @@ import time
 
 import pygame
 
-from .. import config, display, system_control, wifi
+from .. import config, display, system_control, updater, wifi
 from ..display import C, W, H, PAD
 from .keyboard import Keyboard
 from .widgets import Button, draw_signal_bars, draw_lock, draw_tag
@@ -75,6 +75,10 @@ class SettingsPanel:
         self.system_job = None
         self.system_status = ''
         self.system_status_kind = 'info'
+        self.update_job = None
+        self.update_status = ''
+        self.update_status_kind = 'info'
+        self.update_restart_required = False
         self._buttons = []
         self._surf = pygame.Surface((W, H))
 
@@ -89,7 +93,7 @@ class SettingsPanel:
             self.status = ''
 
     def close(self):
-        if self._system_busy():
+        if self._system_busy() or self._update_busy():
             return
         if self.state in ('OPEN', 'OPENING'):
             self.state = 'CLOSING'
@@ -131,8 +135,56 @@ class SettingsPanel:
     def _system_busy(self):
         return self.system_state == 'dispatching'
 
+    def _update_busy(self):
+        return self.update_job is not None and not self.update_job.done
+
+    @staticmethod
+    def _update_wifi_connected():
+        snapshot = wifi.connection_supervisor_snapshot()
+        return (
+            bool(snapshot.active_uuid)
+            and snapshot.phase in ('connected', 'reconnected')
+        )
+
+    def _start_update(self):
+        if self._system_busy() or self._update_busy():
+            return
+        if display.DEV:
+            self.update_status = 'App updates are disabled in dev mode.'
+            self.update_status_kind = 'error'
+            return
+        if not self._update_wifi_connected():
+            self.update_status = 'Connect to Wi-Fi before updating.'
+            self.update_status_kind = 'error'
+            return
+        self.system_state = 'idle'
+        self.system_status = ''
+        self.system_status_kind = 'info'
+        self.update_job = updater.update_async()
+        self.update_status = self.update_job.status
+        self.update_status_kind = 'info'
+
+    def _update_app_job(self):
+        if self.update_job is None:
+            return
+        job = self.update_job
+        self.update_status = job.status
+        self.update_status_kind = 'info'
+        if not job.done:
+            return
+        self.update_job = None
+        self.update_status = job.message
+        self.update_status_kind = 'success' if job.ok else 'error'
+        if job.ok and job.changed:
+            # This process is still running modules loaded before the pull.
+            # Keep the restart requirement through later checks/failures.
+            self.update_restart_required = True
+
     def _begin_system_confirmation(self, target):
-        if target not in ('service', 'device') or self._system_busy():
+        if (
+                target not in ('service', 'device')
+                or self._system_busy()
+                or self._update_busy()):
             return
         self.system_state = 'confirming'
         self.system_confirm_target = target
@@ -147,7 +199,7 @@ class SettingsPanel:
         self.system_confirm_target = ''
 
     def _confirm_system_action(self):
-        if self.system_state != 'confirming':
+        if self.system_state != 'confirming' or self._update_busy():
             return
         target = self.system_confirm_target
         if target not in ('service', 'device'):
@@ -636,6 +688,7 @@ class SettingsPanel:
                 self.state = 'CLOSED'
 
         self._update_system_action(dt_ms)
+        self._update_app_job()
         self._update_wifi_jobs()
         self._update_connection_supervisor()
 
@@ -818,7 +871,10 @@ class SettingsPanel:
         if back_to is not None:
             blocked = (
                 (back_to == 'wifi' and self._wifi_busy())
-                or (self.view == 'system' and self._system_busy())
+                or (
+                    self.view == 'system'
+                    and (self._system_busy() or self._update_busy())
+                )
             )
             b = Button((PAD, 5, 82, 26), 'BACK',
                        on_tap=lambda _b: self._goto(back_to), font=display.font_xs,
@@ -1238,14 +1294,67 @@ class SettingsPanel:
         if self.system_state in ('confirming', 'dispatching'):
             self._render_system_confirmation(btns)
             return
-        device_restart_enabled = not display.DEV
+        update_busy = self._update_busy()
+        wifi_connected = self._update_wifi_connected()
+        update_enabled = (
+            not display.DEV
+            and wifi_connected
+            and not update_busy
+            and not self._system_busy()
+        )
+        restart_enabled = not update_busy
+        device_restart_enabled = not display.DEV and restart_enabled
 
-        service = Button(
-            (PAD, 52, W - 2 * PAD, 50),
-            'RESTART DISPLAY SERVICE',
-            on_tap=lambda _b: self._begin_system_confirmation('service'),
+        update = Button(
+            (PAD, 42, W - 2 * PAD, 42),
+            'CHECKING FOR UPDATES...' if update_busy else 'UPDATE APP',
+            on_tap=lambda _b: self._start_update(),
             font=display.font_xs,
             fg=C['arrive'],
+            enabled=update_enabled,
+        )
+        update.draw()
+        if self.update_status:
+            update_color = (
+                C['err']
+                if self.update_status_kind == 'error'
+                else C['ok']
+                if self.update_status_kind == 'success'
+                else C['dim']
+            )
+            self._draw_status(
+                self.update_status,
+                update_color,
+                92,
+                W - 2 * PAD,
+            )
+        else:
+            update_helper = (
+                'Unavailable in dev mode.'
+                if display.DEV
+                else 'Pulls latest origin/main.'
+                if wifi_connected
+                else 'Connect to Wi-Fi to update.'
+            )
+            display.blit_center(
+                update_helper,
+                display.font_xs,
+                C['dim'],
+                W // 2,
+                96,
+            )
+
+        service = Button(
+            (PAD, 132, W - 2 * PAD, 42),
+            (
+                'RESTART DISPLAY TO APPLY'
+                if self.update_restart_required
+                else 'RESTART DISPLAY SERVICE'
+            ),
+            on_tap=lambda _b: self._begin_system_confirmation('service'),
+            font=display.font_xs,
+            fg=C['ok'] if self.update_restart_required else C['arrive'],
+            enabled=restart_enabled,
         )
         service.draw()
         display.blit_center(
@@ -1253,18 +1362,11 @@ class SettingsPanel:
             display.font_xs,
             C['dim'],
             W // 2,
-            112,
-        )
-        display.blit_center(
-            'Raspberry Pi stays on.',
-            display.font_xs,
-            C['ghost'],
-            W // 2,
-            134,
+            182,
         )
 
         device = Button(
-            (PAD, 160, W - 2 * PAD, 50),
+            (PAD, 202, W - 2 * PAD, 42),
             'RESTART RASPBERRY PI',
             on_tap=lambda _b: self._begin_system_confirmation('device'),
             font=display.font_xs,
@@ -1272,27 +1374,19 @@ class SettingsPanel:
             enabled=device_restart_enabled,
         )
         device.draw()
+        device_helper = (
+            'Unavailable in dev mode.'
+            if display.DEV
+            else 'Update in progress.'
+            if update_busy
+            else 'Reboots the entire device.'
+        )
         display.blit_center(
-            (
-                'Reboots the entire device.'
-                if device_restart_enabled
-                else 'Unavailable in dev mode.'
-            ),
+            device_helper,
             display.font_xs,
             C['dim'],
             W // 2,
-            220,
-        )
-        display.blit_center(
-            (
-                'Display unavailable.'
-                if device_restart_enabled
-                else 'Use service restart only.'
-            ),
-            display.font_xs,
-            C['ghost'],
-            W // 2,
-            242,
+            252,
         )
 
         if self.system_status:
@@ -1309,7 +1403,7 @@ class SettingsPanel:
                 274,
                 W - 2 * PAD,
             )
-        self._buttons = btns + [service, device]
+        self._buttons = btns + [update, service, device]
 
     def _render_system_confirmation(self, btns):
         target = (
