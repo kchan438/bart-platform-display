@@ -22,8 +22,16 @@ from .widgets import Button, draw_signal_bars, draw_lock, draw_tag
 _SLIDE_SEC = 0.22
 _HEADER_H = 34
 _ROW_H = 40
-_LIST_TOP = 64
+_LIST_STATUS_TOP = 40
+# Reserve enough vertical space for both lines of a wrapped Wi-Fi status.
+_LIST_TOP = 82
 _LIST_BOTTOM = H - 8
+_SCROLLBAR_W = 40
+_SCROLL_BUTTON_H = 40
+_SCROLL_THUMB_MIN_H = 32
+_LIST_RIGHT = W - _SCROLLBAR_W
+_DETAIL_ACTION_TOP = H - 40
+_STATUS_ACTION_GAP = 4
 
 
 class SettingsPanel:
@@ -44,6 +52,8 @@ class SettingsPanel:
         self.status_kind = 'info'       # info | success | error
         self._after_scan_message = ''
         self.scroll = 0
+        self._scrollbar_dragging = False
+        self._scrollbar_drag_offset = 0
 
         self.api_saved = False
         self._buttons = []
@@ -65,12 +75,15 @@ class SettingsPanel:
             self.keyboard = None
 
     def _goto(self, view):
+        previous = self.view
         self.view = view
         self.status = ''
         self.status_kind = 'info'
-        self.scroll = 0
-        if view == 'wifi':
-            self._start_scan()
+        self._scrollbar_dragging = False
+        if view == 'wifi' and previous != 'wifi_detail':
+            # Entering the list reads NetworkManager's existing AP cache.
+            # A hardware rescan happens only when the user taps RESCAN.
+            self._start_scan(rescan=False)
         if view == 'apikey':
             self.api_saved = False
 
@@ -81,12 +94,13 @@ class SettingsPanel:
             or (self.action_job is not None and not self.action_job.done)
         )
 
-    def _start_scan(self, after_message=''):
+    def _start_scan(self, after_message='', rescan=True):
         if self._wifi_busy():
             return
-        self.scan_job = wifi.scan_async(rescan=True)
+        self.scan_job = wifi.scan_async(rescan=rescan)
         self._after_scan_message = after_message
-        self.status = 'Scanning...'
+        self.status = 'Scanning...' if rescan else 'Refreshing...'
+        self.scan_job.set_status(self.status)
         self.status_kind = 'info'
 
     def _update_wifi_jobs(self):
@@ -98,6 +112,7 @@ class SettingsPanel:
                 self.scan_job = None
                 if job.networks or job.ok:
                     self.networks = job.networks
+                    self._clamp_scroll()
                 after_message = self._after_scan_message
                 self._after_scan_message = ''
                 if not job.ok:
@@ -135,9 +150,8 @@ class SettingsPanel:
                             network.active = False
                 self.selected = None
                 self.detail_info = []
-                self.scroll = 0
                 self.view = 'wifi'
-                self._start_scan(after_message=job.message)
+                self._start_scan(after_message=job.message, rescan=False)
                 return
 
             self.status = job.message
@@ -191,22 +205,132 @@ class SettingsPanel:
             self.close()
             return
 
-        # Drag scrolls the Wi-Fi list.
         if kind == 'drag' and self.view == 'wifi':
-            self.scroll = max(self._min_scroll(), min(0, self.scroll + event['dy']))
+            if (
+                    not self._scrollbar_dragging
+                    and event.get('dx') == 0
+                    and event.get('dy') == 0):
+                # The resistive panel's press coordinate can be noisy. Its
+                # first drag sample is the recognizer's stable re-anchor.
+                thumb = self._scrollbar_thumb_hit_rect()
+                if self._point_in_rect(event['x'], event['y'], thumb):
+                    self._scrollbar_dragging = True
+                    self._scrollbar_drag_offset = event['y'] - thumb[1]
+            if self._scrollbar_dragging:
+                self._drag_scrollbar(event['y'])
             return
 
         if kind == 'release' and event.get('tap'):
+            was_dragging = self._scrollbar_dragging
+            self._scrollbar_dragging = False
+            if was_dragging:
+                return
             for btn in self._buttons:
                 if btn.hit(event['x'], event['y']):
                     if btn.on_tap:
                         btn.on_tap(btn)
                     return
+        elif kind == 'release':
+            self._scrollbar_dragging = False
 
     def _min_scroll(self):
         content_h = len(self.networks) * _ROW_H
         visible_h = _LIST_BOTTOM - _LIST_TOP
         return min(0, visible_h - content_h)
+
+    def _clamp_scroll(self):
+        self.scroll = max(self._min_scroll(), min(0, self.scroll))
+
+    def _scroll_rows(self, rows):
+        self.scroll += rows * _ROW_H
+        self._clamp_scroll()
+
+    def _scrollbar_metrics(self):
+        track_top = _LIST_TOP + _SCROLL_BUTTON_H
+        track_h = (
+            _LIST_BOTTOM
+            - _LIST_TOP
+            - 2 * _SCROLL_BUTTON_H
+        )
+        visible_h = _LIST_BOTTOM - _LIST_TOP
+        content_h = len(self.networks) * _ROW_H
+        if content_h <= visible_h or content_h <= 0:
+            return track_top, track_h, track_top, track_h
+
+        thumb_h = max(
+            _SCROLL_THUMB_MIN_H,
+            int(track_h * visible_h / content_h),
+        )
+        thumb_h = min(track_h, thumb_h)
+        travel = track_h - thumb_h
+        scroll_range = -self._min_scroll()
+        ratio = (-self.scroll / scroll_range) if scroll_range else 0
+        thumb_top = track_top + round(travel * ratio)
+        return track_top, track_h, thumb_top, thumb_h
+
+    def _scrollbar_thumb_rect(self):
+        _, _, thumb_top, thumb_h = self._scrollbar_metrics()
+        return (_LIST_RIGHT + 5, thumb_top, _SCROLLBAR_W - 10, thumb_h)
+
+    def _scrollbar_thumb_hit_rect(self):
+        _, _, thumb_top, thumb_h = self._scrollbar_metrics()
+        return (_LIST_RIGHT, thumb_top, _SCROLLBAR_W, thumb_h)
+
+    @staticmethod
+    def _point_in_rect(x, y, rect):
+        left, top, width, height = rect
+        return left <= x < left + width and top <= y < top + height
+
+    def _drag_scrollbar(self, pointer_y):
+        track_top, track_h, _, thumb_h = self._scrollbar_metrics()
+        travel = track_h - thumb_h
+        scroll_range = -self._min_scroll()
+        if travel <= 0 or scroll_range <= 0:
+            self.scroll = 0
+            return
+        thumb_top = pointer_y - self._scrollbar_drag_offset
+        thumb_top = max(track_top, min(track_top + travel, thumb_top))
+        ratio = (thumb_top - track_top) / travel
+        self.scroll = -round(scroll_range * ratio)
+        self._clamp_scroll()
+
+    @staticmethod
+    def _status_lines(text, font, max_width, max_lines=2):
+        words = str(text).split()
+        if not words:
+            return []
+        lines = []
+        while words and len(lines) < max_lines:
+            if len(lines) == max_lines - 1:
+                lines.append(display.truncate(' '.join(words), font, max_width))
+                break
+            line = words.pop(0)
+            while words and font.size(line + ' ' + words[0])[0] <= max_width:
+                line += ' ' + words.pop(0)
+            lines.append(display.truncate(line, font, max_width))
+        return lines
+
+    def _draw_status(self, text, color, top, max_width):
+        lines = self._status_lines(text, display.font_xs, max_width)
+        line_h = display.font_xs.get_height() + 2
+        for index, line in enumerate(lines):
+            display.blit_center(
+                line,
+                display.font_xs,
+                color,
+                W // 2,
+                top + index * line_h,
+            )
+
+    def _status_top_before(self, text, bottom, max_width):
+        """Place all wrapped status lines above a lower UI boundary."""
+        line_count = len(self._status_lines(
+            text,
+            display.font_xs,
+            max_width,
+        ))
+        line_h = display.font_xs.get_height() + 2
+        return bottom - line_count * line_h - _STATUS_ACTION_GAP
 
     # -- rendering ----------------------------------------------------------
     def render(self):
@@ -290,12 +414,16 @@ class SettingsPanel:
         btns.append(rescan)
 
         if self.status:
-            status = display.truncate(self.status, display.font_xs, W - 2 * PAD)
             status_color = {
                 'success': C['ok'],
                 'error': C['err'],
             }.get(self.status_kind, C['dim'])
-            display.blit_center(status, display.font_xs, status_color, W // 2, 44)
+            self._draw_status(
+                self.status,
+                status_color,
+                _LIST_STATUS_TOP,
+                W - 2 * PAD,
+            )
 
         clip = pygame.Rect(0, _LIST_TOP, W, _LIST_BOTTOM - _LIST_TOP)
         self._surf.set_clip(clip)
@@ -306,20 +434,74 @@ class SettingsPanel:
                 btns.append(b)
             y += _ROW_H
         self._surf.set_clip(None)
+        btns += self._render_scrollbar()
 
         if not self.networks and self.scan_job is None:
-            display.blit_center('No networks found', display.font_xs, C['ghost'], W // 2, 120)
+            display.blit_center(
+                'No networks found',
+                display.font_xs,
+                C['ghost'],
+                _LIST_RIGHT // 2,
+                120,
+            )
         self._buttons = btns
 
+    def _render_scrollbar(self):
+        can_scroll = self._min_scroll() < 0 and not self._wifi_busy()
+        up = Button(
+            (_LIST_RIGHT, _LIST_TOP, _SCROLLBAR_W, _SCROLL_BUTTON_H),
+            'UP',
+            on_tap=lambda _b: self._scroll_rows(1),
+            font=display.font_xs,
+            enabled=can_scroll and self.scroll < 0,
+        )
+        down = Button(
+            (
+                _LIST_RIGHT,
+                _LIST_BOTTOM - _SCROLL_BUTTON_H,
+                _SCROLLBAR_W,
+                _SCROLL_BUTTON_H,
+            ),
+            'DN',
+            on_tap=lambda _b: self._scroll_rows(-1),
+            font=display.font_xs,
+            enabled=can_scroll and self.scroll > self._min_scroll(),
+        )
+        up.draw()
+        down.draw()
+
+        track_top, track_h, _, _ = self._scrollbar_metrics()
+        track = pygame.Rect(
+            _LIST_RIGHT + 5,
+            track_top,
+            _SCROLLBAR_W - 10,
+            track_h,
+        )
+        pygame.draw.rect(self._surf, C['panel'], track)
+        pygame.draw.rect(self._surf, C['dim'], track, 1)
+
+        thumb = pygame.Rect(self._scrollbar_thumb_rect())
+        pygame.draw.rect(
+            self._surf,
+            C['on'] if can_scroll else C['ghost'],
+            thumb,
+        )
+        return [up, down]
+
     def _network_row(self, net, y):
-        row = pygame.Rect(0, y, W, _ROW_H)
+        row = pygame.Rect(0, y, _LIST_RIGHT, _ROW_H)
         if net.active:
             pygame.draw.rect(self._surf, C['panel_hi'], row)
-        display.divider(y + _ROW_H - 1, x0=PAD, x1=W - PAD, color=C['ghost'])
+        display.divider(
+            y + _ROW_H - 1,
+            x0=PAD,
+            x1=_LIST_RIGHT - PAD,
+            color=C['ghost'],
+        )
 
         name_color = C['arrive'] if net.active else C['on']
         # right-side cluster: signal bars, lock, saved/active tag
-        right = W - PAD
+        right = _LIST_RIGHT - PAD
         bars_w = 4 * 8
         signal_x = right - bars_w
         draw_signal_bars(signal_x, y + _ROW_H // 2 + 8, net.signal, active=net.active)
@@ -340,7 +522,7 @@ class SettingsPanel:
         # the header/footer can't be tapped there.
         top = max(y, _LIST_TOP)
         bottom = min(y + _ROW_H, _LIST_BOTTOM)
-        hit = pygame.Rect(0, top, W, max(0, bottom - top))
+        hit = pygame.Rect(0, top, _LIST_RIGHT, max(0, bottom - top))
         return Button(hit, '', on_tap=lambda _b, n=net: self._select(n),
                       bg=C['panel'], border=None, enabled=not self._wifi_busy())
 
@@ -397,16 +579,24 @@ class SettingsPanel:
                 draw_lock(W - PAD - vw - 22, y, color=color)
             y += 24
 
+        bw = (W - 2 * PAD - 10) // 2
+        by = _DETAIL_ACTION_TOP
         if self.status:
-            status = display.truncate(self.status, display.font_xs, W - 2 * PAD)
             status_color = {
                 'success': C['ok'],
                 'error': C['err'],
             }.get(self.status_kind, C['arrive'])
-            display.blit_center(status, display.font_xs, status_color, W // 2, H - 62)
+            self._draw_status(
+                self.status,
+                status_color,
+                self._status_top_before(
+                    self.status,
+                    by,
+                    W - 2 * PAD,
+                ),
+                W - 2 * PAD,
+            )
 
-        bw = (W - 2 * PAD - 10) // 2
-        by = H - 40
         busy = self._wifi_busy()
         action_kind = self.action_job.kind if self.action_job is not None else ''
         if net.active:

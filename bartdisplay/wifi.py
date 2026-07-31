@@ -603,6 +603,17 @@ def _clone_network(net, **changes):
     return Network(**values)
 
 
+def _network_sort_key(net):
+    """Keep the active and saved networks above unsaved scan results."""
+    return (
+        not net.active,
+        not net.saved,
+        net.stale,
+        -net.signal,
+        net.ssid.lower(),
+    )
+
+
 def _parse_scan_output(
         out,
         profiles=None,
@@ -693,7 +704,7 @@ def _parse_scan_output(
             break
 
     networks = list(by_ssid.values())
-    networks.sort(key=lambda net: (not net.active, -net.signal, net.ssid.lower()))
+    networks.sort(key=_network_sort_key)
     return networks
 
 
@@ -808,20 +819,40 @@ def _merge_scan_cache(fresh, preserve_profile_identity=False):
         _scan_cache.pop(ssid, None)
 
     networks = list(merged.values())
-    networks.sort(
-        key=lambda net: (
-            not net.active,
-            net.stale,
-            -net.signal,
-            net.ssid.lower(),
-        )
-    )
+    networks.sort(key=_network_sort_key)
     return networks, any(net.stale for net in networks)
 
 
 def _recent_cached_networks():
     networks, partial = _merge_scan_cache([])
     return networks, partial
+
+
+def _log_connection_snapshot(iface, active, profiles):
+    """Write a secret-free state snapshot for intermittent-drop diagnosis."""
+    profile_count = sum(len(candidates) for candidates in profiles.values())
+    autoconnect_off = sum(
+        1
+        for candidates in profiles.values()
+        for profile in candidates
+        if not profile.autoconnect
+    )
+    if active.query_ok:
+        print(
+            f'[wifi] device={iface!r} state={active.state!r} '
+            f'reason={active.reason!r} active_profile={bool(active.uuid)} '
+            f'saved_profiles={profile_count} '
+            f'autoconnect_off={autoconnect_off}',
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f'[wifi] device={iface!r} state unavailable '
+            f'({active.error_code or "state_query_failed"}); '
+            f'saved_profiles={profile_count} '
+            f'autoconnect_off={autoconnect_off}',
+            file=sys.stderr,
+        )
 
 
 def _scan_detailed_unlocked(rescan=True):
@@ -871,6 +902,7 @@ def _scan_detailed_unlocked(rescan=True):
             )
 
     active = active_connection(iface)
+    _log_connection_snapshot(iface, active, profiles)
     fresh, list_code, list_message, list_detail = _read_scan_rows(
         profiles,
         active,
@@ -1648,7 +1680,7 @@ def _connect_worker(job, net, password):
         code, message = _classify_error(rc, out, err)
         timed_out = _nmcli_timed_out(rc, out, err)
         timeout_stage = 'unknown'
-        if timed_out:
+        if timed_out or code == 'connect_failed':
             timeout_stage = (
                 'authentication'
                 if code == 'authentication_failed'
@@ -1659,6 +1691,15 @@ def _connect_worker(job, net, password):
                 )
             )
 
+            if not timed_out and code == 'connect_failed':
+                if timeout_stage == 'authentication':
+                    code = 'authentication_failed'
+                    message = 'Authentication failed'
+                elif timeout_stage == 'ip':
+                    code = 'dhcp_failed'
+                    message = 'Could not obtain IP'
+
+        if timed_out:
             # nmcli can exhaust its wait at the same instant NetworkManager
             # enters IP configuration or finishes activating. Give that stage
             # the normal bounded verification window before tearing down what

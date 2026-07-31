@@ -67,6 +67,80 @@ with mock.patch.dict(
 
 
 class WifiUiStateTests(unittest.TestCase):
+    def test_wrapped_detail_status_stays_above_action_buttons(self):
+        panel = SettingsPanel()
+        font = types.SimpleNamespace(
+            get_height=lambda: 17,
+            size=lambda text: (len(text) * 8, 17),
+        )
+        max_width = 120
+        status = 'Previous connection cleanup is still pending'
+
+        with mock.patch.object(
+                settings_module.display,
+                'font_xs',
+                font,
+                create=True,
+        ), mock.patch.object(
+                settings_module.display,
+                'truncate',
+                lambda text, _font, _width: text,
+                create=True,
+        ):
+            lines = panel._status_lines(status, font, max_width)
+            top = panel._status_top_before(
+                status,
+                settings_module._DETAIL_ACTION_TOP,
+                max_width,
+            )
+
+        line_h = font.get_height() + 2
+        rendered_bottom = (
+            top
+            + (len(lines) - 1) * line_h
+            + font.get_height()
+        )
+        self.assertEqual(len(lines), 2)
+        self.assertLessEqual(
+            rendered_bottom,
+            settings_module._DETAIL_ACTION_TOP
+            - settings_module._STATUS_ACTION_GAP,
+        )
+
+    def test_entering_wifi_uses_cached_refresh_without_hardware_rescan(self):
+        panel = SettingsPanel()
+        panel.view = 'menu'
+        job = wifi.WifiJob('scan')
+
+        with mock.patch.object(wifi, 'scan_async', return_value=job) as scan:
+            panel._goto('wifi')
+
+        scan.assert_called_once_with(rescan=False)
+        self.assertIs(panel.scan_job, job)
+        self.assertEqual(panel.status, 'Refreshing...')
+
+    def test_returning_from_detail_preserves_list_and_scroll_without_refresh(self):
+        panel = SettingsPanel()
+        panel.view = 'wifi_detail'
+        panel.scroll = -80
+
+        with mock.patch.object(wifi, 'scan_async') as scan:
+            panel._goto('wifi')
+
+        scan.assert_not_called()
+        self.assertEqual(panel.view, 'wifi')
+        self.assertEqual(panel.scroll, -80)
+
+    def test_explicit_scan_requests_hardware_rescan(self):
+        panel = SettingsPanel()
+        job = wifi.WifiJob('scan')
+
+        with mock.patch.object(wifi, 'scan_async', return_value=job) as scan:
+            panel._start_scan()
+
+        scan.assert_called_once_with(rescan=True)
+        self.assertEqual(panel.status, 'Scanning...')
+
     def test_detail_worker_does_not_overwrite_newer_ui_state(self):
         panel = SettingsPanel()
         original = wifi.Network('Original', active=True)
@@ -170,7 +244,7 @@ class WifiUiStateTests(unittest.TestCase):
         self.assertEqual(panel.status_kind, 'error')
         self.assertIsNone(panel.action_job)
 
-    def test_disconnect_success_returns_to_list_and_starts_scan(self):
+    def test_disconnect_success_returns_to_list_and_refreshes_cached_state(self):
         panel = SettingsPanel()
         network = wifi.Network('Home', active=True)
         panel.networks = [network]
@@ -181,14 +255,19 @@ class WifiUiStateTests(unittest.TestCase):
         panel.action_job = action
         scan = wifi.WifiJob('scan')
 
-        with mock.patch.object(wifi, 'scan_async', return_value=scan):
+        with mock.patch.object(
+                wifi,
+                'scan_async',
+                return_value=scan,
+        ) as scan_async:
             panel._update_wifi_jobs()
 
+        scan_async.assert_called_once_with(rescan=False)
         self.assertEqual(panel.view, 'wifi')
         self.assertIsNone(panel.selected)
         self.assertIs(panel.scan_job, scan)
         self.assertEqual(panel._after_scan_message, 'Disconnected from Home')
-        self.assertEqual(panel.status, 'Scanning...')
+        self.assertEqual(panel.status, 'Refreshing...')
         self.assertFalse(network.active)
 
         scan.finish(
@@ -203,6 +282,30 @@ class WifiUiStateTests(unittest.TestCase):
             panel.status,
             'Disconnected from Home - Showing recent results',
         )
+
+    def test_connect_success_returns_to_list_without_hardware_rescan(self):
+        panel = SettingsPanel()
+        network = wifi.Network('Home', saved=True)
+        panel.networks = [network]
+        panel.selected = network
+        panel.view = 'wifi_detail'
+        action = wifi.WifiJob('connect', network.ssid)
+        action.finish(True, 'Connected to Home', code='connected')
+        panel.action_job = action
+        scan = wifi.WifiJob('scan')
+
+        with mock.patch.object(
+                wifi,
+                'scan_async',
+                return_value=scan,
+        ) as scan_async:
+            panel._update_wifi_jobs()
+
+        scan_async.assert_called_once_with(rescan=False)
+        self.assertEqual(panel.view, 'wifi')
+        self.assertIsNone(panel.selected)
+        self.assertEqual(panel._after_scan_message, 'Connected to Home')
+        self.assertEqual(panel.status, 'Refreshing...')
 
     def test_failed_follow_up_scan_keeps_disconnect_confirmation(self):
         panel = SettingsPanel()
@@ -310,6 +413,109 @@ class WifiUiStateTests(unittest.TestCase):
         self.assertEqual(panel.networks, [recent])
         self.assertEqual(panel.status, 'Showing recent results')
         self.assertEqual(panel.status_kind, 'info')
+
+    def test_scroll_buttons_move_one_row_and_clamp_at_each_end(self):
+        panel = SettingsPanel()
+        panel.networks = [wifi.Network(str(i)) for i in range(10)]
+
+        panel._scroll_rows(-1)
+        self.assertEqual(panel.scroll, -40)
+
+        for _ in range(20):
+            panel._scroll_rows(-1)
+        self.assertEqual(panel.scroll, panel._min_scroll())
+
+        for _ in range(20):
+            panel._scroll_rows(1)
+        self.assertEqual(panel.scroll, 0)
+
+    def test_scrollbar_thumb_drag_maps_to_full_scroll_range(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'wifi'
+        panel.networks = [wifi.Network(str(i)) for i in range(12)]
+        thumb = panel._scrollbar_thumb_rect()
+        x = thumb[0] + 1
+        y = thumb[1] + 4
+
+        panel.handle({'kind': 'press', 'x': x, 'y': y})
+        panel.handle({
+            'kind': 'drag',
+            'x': x,
+            'y': y,
+            'dx': 0,
+            'dy': 0,
+        })
+        track_top, track_h, _, thumb_h = panel._scrollbar_metrics()
+        panel.handle({
+            'kind': 'drag',
+            'x': x,
+            'y': track_top + track_h - thumb_h + 4,
+            'dx': 0,
+            'dy': track_h,
+        })
+
+        self.assertEqual(panel.scroll, panel._min_scroll())
+
+    def test_scrollbar_drag_can_start_from_stable_first_move_sample(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'wifi'
+        panel.networks = [wifi.Network(str(i)) for i in range(12)]
+        thumb = panel._scrollbar_thumb_rect()
+        x = thumb[0] + 1
+        y = thumb[1] + 4
+
+        panel.handle({'kind': 'press', 'x': 0, 'y': 0})
+        panel.handle({
+            'kind': 'drag',
+            'x': x,
+            'y': y,
+            'dx': 0,
+            'dy': 0,
+        })
+
+        self.assertTrue(panel._scrollbar_dragging)
+        self.assertEqual(panel._scrollbar_drag_offset, 4)
+
+    def test_noisy_press_on_thumb_does_not_start_scrollbar_drag(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'wifi'
+        panel.networks = [wifi.Network(str(i)) for i in range(12)]
+        thumb = panel._scrollbar_thumb_rect()
+
+        panel.handle({
+            'kind': 'press',
+            'x': thumb[0] + 1,
+            'y': thumb[1] + 4,
+        })
+        panel.handle({
+            'kind': 'drag',
+            'x': 100,
+            'y': 180,
+            'dx': 0,
+            'dy': 0,
+        })
+
+        self.assertFalse(panel._scrollbar_dragging)
+        self.assertEqual(panel.scroll, 0)
+
+    def test_dragging_list_body_no_longer_scrolls_rows(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'wifi'
+        panel.networks = [wifi.Network(str(i)) for i in range(12)]
+
+        panel.handle({
+            'kind': 'drag',
+            'x': 100,
+            'y': 180,
+            'dx': 0,
+            'dy': -80,
+        })
+
+        self.assertEqual(panel.scroll, 0)
 
 
 if __name__ == '__main__':

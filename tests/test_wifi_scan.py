@@ -1,3 +1,4 @@
+import io
 import os
 import threading
 import time
@@ -51,13 +52,36 @@ class WifiTests(unittest.TestCase):
             now=10.0,
         )
 
-        self.assertEqual([net.ssid for net in nets], ['Home:Lab', 'Guest'])
-        self.assertEqual(nets[0].signal, 82)
-        self.assertEqual(nets[0].bssid, 'AA:00:00:00:00:02')
-        self.assertFalse(nets[0].saved)
-        self.assertTrue(nets[1].saved)
-        self.assertEqual(nets[1].profile_uuid, 'guest-uuid')
-        self.assertFalse(nets[1].protected)
+        self.assertEqual([net.ssid for net in nets], ['Guest', 'Home:Lab'])
+        self.assertTrue(nets[0].saved)
+        self.assertEqual(nets[0].profile_uuid, 'guest-uuid')
+        self.assertFalse(nets[0].protected)
+        self.assertEqual(nets[1].signal, 82)
+        self.assertEqual(nets[1].bssid, 'AA:00:00:00:00:02')
+        self.assertFalse(nets[1].saved)
+
+    def test_scan_order_is_active_then_saved_then_unsaved(self):
+        profiles = {
+            'Saved': [profile('Saved', 'saved-profile', 'saved-uuid')],
+            'Online': [profile('Online', 'online-profile', 'online-uuid')],
+        }
+        out = '\n'.join([
+            r' :95:WPA2:Nearby:AA\:00\:00\:00\:00\:01:wlan0',
+            r' :25:WPA2:Saved:AA\:00\:00\:00\:00\:02:wlan0',
+            r'*:15:WPA2:Online:AA\:00\:00\:00\:00\:03:wlan0',
+        ])
+
+        nets = wifi._parse_scan_output(
+            out,
+            profiles,
+            active('online-uuid', 'online-profile'),
+            now=10.0,
+        )
+
+        self.assertEqual(
+            [net.ssid for net in nets],
+            ['Online', 'Saved', 'Nearby'],
+        )
 
     def test_parse_scan_output_prefers_active_bssid_over_stronger_duplicate(self):
         profiles = {'Home': [profile()]}
@@ -118,6 +142,38 @@ class WifiTests(unittest.TestCase):
         self.assertFalse(result.complete)
         self.assertEqual(result.profiles, {})
         self.assertEqual(result.code, 'profile_query_failed')
+
+    def test_connection_snapshot_logs_state_without_profile_identity(self):
+        profiles = {
+            'PrivateSSID': [
+                wifi.SavedProfile(
+                    'PrivateSSID',
+                    'private-profile-name',
+                    'private-uuid',
+                    autoconnect=False,
+                ),
+            ],
+        }
+        current = wifi.ActiveConnection(
+            'wlan0',
+            state='30 (disconnected)',
+            name='private-profile-name',
+            uuid='private-uuid',
+            reason='7 (Secrets were required)',
+        )
+        output = io.StringIO()
+
+        with mock.patch.object(wifi.sys, 'stderr', output):
+            wifi._log_connection_snapshot('wlan0', current, profiles)
+
+        logged = output.getvalue()
+        self.assertIn("state='30 (disconnected)'", logged)
+        self.assertIn("reason='7 (Secrets were required)'", logged)
+        self.assertIn('active_profile=True', logged)
+        self.assertIn('autoconnect_off=1', logged)
+        self.assertNotIn('PrivateSSID', logged)
+        self.assertNotIn('private-profile-name', logged)
+        self.assertNotIn('private-uuid', logged)
 
     def test_incomplete_discovery_preserves_cached_profile_identity(self):
         cached = wifi.Network(
@@ -327,6 +383,37 @@ class WifiTests(unittest.TestCase):
         self.assertEqual(result.code, 'radio_disabled')
         self.assertEqual(result.message, 'Wi-Fi is disabled')
         run.assert_not_called()
+
+    def test_cache_only_refresh_does_not_request_hardware_rescan(self):
+        cached = wifi.Network('Home', 80, 'WPA2', iface='wlan0')
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(wifi, '_wifi_radio', return_value='enabled'), \
+                mock.patch.object(wifi, 'wifi_iface', return_value='wlan0'), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=wifi.ActiveConnection('wlan0'),
+                ), \
+                mock.patch.object(wifi, '_log_connection_snapshot'), \
+                mock.patch.object(
+                    wifi,
+                    '_read_scan_rows',
+                    return_value=([cached], 'ok', '', ''),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_request_rescan_and_wait',
+                ) as request:
+            result = wifi._scan_detailed_unlocked(rescan=False)
+
+        request.assert_not_called()
+        self.assertTrue(result.ok)
+        self.assertEqual([net.ssid for net in result.networks], ['Home'])
 
     def test_scan_busy_returns_immediately(self):
         wifi._operation_lock.acquire()
@@ -1602,6 +1689,47 @@ class WifiTests(unittest.TestCase):
             )
 
         self.assertEqual(stage, 'authentication')
+
+    def test_generic_activation_error_uses_networkmanager_failure_reason(self):
+        net = wifi.Network(
+            'Home',
+            security='WPA2',
+            saved=True,
+            iface='wlan0',
+            profile_uuid='uuid-home',
+        )
+        job = wifi.WifiJob('connect', net.ssid)
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({'Home': [profile()]}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    side_effect=[
+                        wifi.ActiveConnection('wlan0', state='30 (disconnected)'),
+                        wifi.ActiveConnection(
+                            'wlan0',
+                            state='30 (disconnected)',
+                            uuid='uuid-home',
+                            reason='9 (Supplicant configuration failed)',
+                        ),
+                    ],
+                ), \
+                mock.patch.object(
+                    wifi,
+                    '_activate_profile',
+                    return_value=(10, '', 'Activation failed'),
+                ):
+            wifi._connect_worker(job, net, None)
+
+        self.assertFalse(job.ok)
+        self.assertEqual(job.code, 'authentication_failed')
+        self.assertEqual(job.message, 'Authentication failed')
+        self.assertTrue(job.needs_password)
 
     def test_activation_timeout_that_finishes_with_ip_is_salvaged(self):
         net = wifi.Network(
