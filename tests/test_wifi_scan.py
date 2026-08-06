@@ -1413,6 +1413,149 @@ class WifiTests(unittest.TestCase):
         self.assertEqual(job.code, 'state_query_failed')
         self.assertTrue(net.active)
 
+    def test_forget_deletes_active_profile_and_marks_intentional_after_confirmed_delete(self):
+        net = wifi.Network(
+            'Home',
+            saved=True,
+            active=True,
+            iface='wlan0',
+            profile_uuid='uuid-home',
+        )
+        job = wifi.WifiJob('forget', net.ssid)
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({'Home': [profile()]}),
+                ), \
+                mock.patch.object(wifi, 'active_connection', return_value=active()), \
+                mock.patch.object(wifi, '_run', return_value=(0, '', '')) as run, \
+                mock.patch.object(wifi, '_profile_exists', return_value=False), \
+                mock.patch.object(
+                    wifi,
+                    '_supervisor_note_intentional_disconnect',
+                ) as note_intentional:
+            wifi._forget_worker(job, net)
+
+        self.assertTrue(job.ok)
+        self.assertEqual(job.code, 'forgotten')
+        self.assertFalse(net.saved)
+        self.assertFalse(net.active)
+        self.assertEqual(net.profile_uuid, '')
+        note_intentional.assert_called_once_with('uuid-home')
+        run.assert_called_once_with(
+            [
+                '--wait',
+                str(wifi._NMCLI_PROFILE_WAIT_SEC),
+                'connection',
+                'delete',
+                'uuid',
+                'uuid-home',
+            ],
+            timeout=wifi._NMCLI_PROFILE_TIMEOUT_SEC,
+        )
+
+    def test_forget_active_connection_query_failure_aborts_without_deleting(self):
+        net = wifi.Network(
+            'Home',
+            saved=True,
+            active=True,
+            iface='wlan0',
+            profile_uuid='uuid-home',
+        )
+        job = wifi.WifiJob('forget', net.ssid)
+        failed_state = wifi.ActiveConnection(
+            'wlan0',
+            query_ok=False,
+            error_code='state_query_failed',
+            error_message='Could not read Wi-Fi state',
+        )
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({'Home': [profile()]}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=failed_state,
+                ), \
+                mock.patch.object(wifi, '_run') as run, \
+                mock.patch.object(
+                    wifi,
+                    '_supervisor_note_intentional_disconnect',
+                ) as note_intentional:
+            wifi._forget_worker(job, net)
+
+        self.assertFalse(job.ok)
+        self.assertEqual(job.code, 'state_query_failed')
+        self.assertTrue(net.saved)
+        self.assertTrue(net.active)
+        run.assert_not_called()
+        note_intentional.assert_not_called()
+
+    def test_forget_does_not_mark_intentional_disconnect_when_delete_fails(self):
+        net = wifi.Network(
+            'Home',
+            saved=True,
+            active=True,
+            iface='wlan0',
+            profile_uuid='uuid-home',
+        )
+        job = wifi.WifiJob('forget', net.ssid)
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({'Home': [profile()]}),
+                ), \
+                mock.patch.object(wifi, 'active_connection', return_value=active()), \
+                mock.patch.object(
+                    wifi,
+                    '_run',
+                    return_value=(1, '', 'not authorized'),
+                ), \
+                mock.patch.object(wifi, '_profile_exists', return_value=True), \
+                mock.patch.object(
+                    wifi,
+                    '_supervisor_note_intentional_disconnect',
+                ) as note_intentional:
+            wifi._forget_worker(job, net)
+
+        self.assertFalse(job.ok)
+        self.assertEqual(job.code, 'not_authorized')
+        self.assertTrue(net.saved)
+        self.assertTrue(net.active)
+        note_intentional.assert_not_called()
+
+    def test_forget_network_not_saved_reports_ok_without_deleting(self):
+        net = wifi.Network('Home', saved=False, active=False, iface='wlan0')
+        job = wifi.WifiJob('forget', net.ssid)
+
+        with mock.patch.object(wifi, '_HAVE_NMCLI', True), \
+                mock.patch.object(
+                    wifi,
+                    '_saved_profiles_detailed',
+                    return_value=discovery({}),
+                ), \
+                mock.patch.object(
+                    wifi,
+                    'active_connection',
+                    return_value=wifi.ActiveConnection(
+                        'wlan0', state='30 (disconnected)',
+                    ),
+                ), \
+                mock.patch.object(wifi, '_run') as run:
+            wifi._forget_worker(job, net)
+
+        self.assertTrue(job.ok)
+        self.assertEqual(job.code, 'not_saved')
+        run.assert_not_called()
+
     def test_saved_connection_uses_profile_uuid(self):
         net = wifi.Network(
             'Home',
