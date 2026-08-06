@@ -277,6 +277,7 @@ class WifiJob:
             'scan': 'Scanning...',
             'connect': 'Connecting...',
             'disconnect': 'Disconnecting...',
+            'forget': 'Forgetting network...',
         }.get(kind, 'Working...')
         self.message = ''
         self.code = ''
@@ -424,6 +425,8 @@ def _classify_error(rc, out, err, default='failed'):
         return 'scan_failed', 'Scan failed'
     if default == 'disconnect':
         return 'disconnect_failed', 'Disconnect failed'
+    if default == 'forget':
+        return 'forget_failed', 'Could not forget network'
     return 'connect_failed', 'Failed to connect'
 
 
@@ -2076,8 +2079,8 @@ def _profile_exists(profile_uuid):
     return None
 
 
-def _discard_new_profile(net, profile_uuid):
-    """Remove a profile that never reached a verified connection."""
+def _delete_profile(profile_uuid):
+    """Delete an nmcli connection profile and verify it no longer exists."""
     rc, out, err = _run(
         [
             '--wait',
@@ -2089,8 +2092,21 @@ def _discard_new_profile(net, profile_uuid):
         ],
         timeout=_NMCLI_PROFILE_TIMEOUT_SEC,
     )
-    exists = _profile_exists(profile_uuid)
-    if exists is not False:
+    return _profile_exists(profile_uuid) is False, rc, out, err
+
+
+def _clear_saved_network_state(net):
+    """Reset a Network's saved-profile fields after its profile is gone."""
+    net.saved = False
+    net.profile_name = ''
+    net.profile_uuid = ''
+    net.autoconnect = None
+
+
+def _discard_new_profile(net, profile_uuid):
+    """Remove a profile that never reached a verified connection."""
+    deleted, rc, out, err = _delete_profile(profile_uuid)
+    if not deleted:
         print(
             f'[wifi] failed to remove unverified profile '
             f'{profile_uuid!r}: '
@@ -2100,11 +2116,8 @@ def _discard_new_profile(net, profile_uuid):
         return False
 
     if net is not None and net.profile_uuid == profile_uuid:
-        net.profile_name = ''
-        net.profile_uuid = ''
-        net.saved = False
+        _clear_saved_network_state(net)
         net.profile_known = True
-        net.autoconnect = None
     _autoconnect_restore.pop(profile_uuid, None)
     _reauth_required.discard(profile_uuid)
     return True
@@ -2703,6 +2716,73 @@ def disconnect(net):
         return job.ok, job.message
     finally:
         _operation_lock.release()
+
+
+def forget_async(net):
+    job = WifiJob('forget', net.ssid)
+    _launch_job(job, lambda: _forget_worker(job, net))
+    return job
+
+
+def _forget_worker(job, net):
+    if not _HAVE_NMCLI:
+        ok, message = _mock_forget(net)
+        job.finish(ok, message, code='forgotten' if ok else 'forget_failed')
+        return
+
+    job.set_status('Checking saved network...')
+    discovery = _saved_profiles_detailed()
+    if not discovery.complete:
+        job.finish(
+            False,
+            discovery.message or 'Saved network status unavailable',
+            code=discovery.code or 'profile_query_failed',
+        )
+        return
+
+    iface = net.iface or wifi_iface()
+    active = active_connection(iface)
+    if not active.query_ok:
+        job.finish(
+            False,
+            active.error_message or 'Could not read Wi-Fi state',
+            code=active.error_code or 'state_query_failed',
+        )
+        return
+    active_uuid = active.uuid
+    profile = _profile_for_ssid(
+        discovery.profiles,
+        net.ssid,
+        active_uuid=active_uuid,
+        preferred_uuid=net.profile_uuid,
+    )
+    if profile is None:
+        _clear_saved_network_state(net)
+        job.finish(True, f'{net.ssid} was not saved', code='not_saved')
+        return
+
+    job.set_status('Forgetting network...')
+    deleted, rc, out, err = _delete_profile(profile.uuid)
+    if not deleted:
+        code, message = _classify_error(rc, out, err, default='forget')
+        print(
+            f'[wifi] forget {net.ssid!r} failed ({code}): '
+            f'{_error_text(out, err)}',
+            file=sys.stderr,
+        )
+        job.finish(False, message, code=code)
+        return
+
+    if profile.uuid == active_uuid:
+        # Deletion is confirmed, so the drop it already caused is
+        # intentional; the supervisor must not try to recover a
+        # connection whose profile no longer exists.
+        _supervisor_note_intentional_disconnect(profile.uuid)
+        net.active = False
+    _clear_saved_network_state(net)
+    _autoconnect_restore.pop(profile.uuid, None)
+    _reauth_required.discard(profile.uuid)
+    job.finish(True, f'Forgot {net.ssid}', code='forgotten')
 
 
 # ---------------------------------------------------------------------------
@@ -3721,3 +3801,17 @@ def _mock_disconnect(net):
             network.active = False
     net.active = False
     return True, f'Disconnected from {net.ssid}'
+
+
+def _mock_forget(net):
+    for network in _MOCK:
+        if network.ssid == net.ssid:
+            network.saved = False
+            network.active = False
+            network.profile_name = ''
+            network.profile_uuid = ''
+    net.saved = False
+    net.active = False
+    net.profile_name = ''
+    net.profile_uuid = ''
+    return True, f'Forgot {net.ssid}'

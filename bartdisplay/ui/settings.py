@@ -47,6 +47,7 @@ class SettingsPanel:
         self.networks = []
         self.selected = None           # Network in detail view
         self.detail_info = []          # cached info rows for the detail view
+        self._forget_confirm = False   # awaiting Forget confirmation tap
         self._detail_request_id = 0    # invalidates stale detail worker results
         self.scan_job = None
         self.action_job = None
@@ -105,6 +106,7 @@ class SettingsPanel:
         self.status = ''
         self.status_kind = 'info'
         self._scrollbar_dragging = False
+        self._forget_confirm = False
         if view == 'wifi':
             # The list is intentionally stable until the user requests a scan.
             # Restore the latest scan summary when returning from network detail.
@@ -1063,6 +1065,7 @@ class SettingsPanel:
 
     def _select(self, net):
         self.selected = net
+        self._forget_confirm = False
         if self._supervisor_notice_applies_to(net):
             self.status = self._supervisor_notice
             self.status_kind = self._supervisor_notice_kind
@@ -1136,9 +1139,35 @@ class SettingsPanel:
         busy = self._wifi_busy()
         mutation_busy = self._wifi_mutation_busy()
         action_kind = self.action_job.kind if self.action_job is not None else ''
+
+        if self._forget_confirm:
+            cancel = Button((PAD, by, bw, 30), 'CANCEL',
+                            on_tap=lambda _b: self._cancel_forget(), font=display.font_xs,
+                            enabled=not mutation_busy)
+            confirm = Button((PAD + bw + 10, by, bw, 30), 'FORGET',
+                             on_tap=lambda _b: self._confirm_forget(), font=display.font_xs,
+                             fg=C['err'], enabled=not mutation_busy)
+            cancel.draw()
+            confirm.draw()
+            btns += [cancel, confirm]
+            self._buttons = btns
+            return
+
+        show_forget = net.saved
+        # FORGET/BACK are short, fixed-width; the primary action button (whose
+        # label can be as long as "DISCONNECTING...") takes the rest.
+        forget_w = 120
+        narrow_back_w = 100
+        act_w = (
+            (W - 2 * PAD - forget_w - narrow_back_w - 20)
+            if show_forget
+            else bw
+        )
+        act_x = PAD
+
         if net.active:
             label = 'DISCONNECTING...' if action_kind == 'disconnect' else 'DISCONNECT'
-            act = Button((PAD, by, bw, 30), label,
+            act = Button((act_x, by, act_w, 30), label,
                          on_tap=lambda _b: self._do_disconnect(), font=display.font_xs,
                          enabled=not mutation_busy)
         else:
@@ -1150,7 +1179,7 @@ class SettingsPanel:
                 label = 'CONNECTING...'
             else:
                 label = 'CONNECT'
-            act = Button((PAD, by, bw, 30),
+            act = Button((act_x, by, act_w, 30),
                          label,
                          on_tap=lambda _b: self._do_connect(), font=display.font_xs,
                          enabled=(
@@ -1158,13 +1187,56 @@ class SettingsPanel:
                              and net.supported
                              and self._network_signal_is_current(net)
                          ))
-        back = Button((PAD + bw + 10, by, bw, 30), 'BACK',
+        act.draw()
+        btns.append(act)
+
+        if show_forget:
+            forget_x = act_x + act_w + 10
+            forget_label = 'FORGETTING...' if action_kind == 'forget' else 'FORGET'
+            forget = Button((forget_x, by, forget_w, 30), forget_label,
+                            on_tap=lambda _b: self._begin_forget_confirmation(),
+                            font=display.font_xs, fg=C['err'],
+                            enabled=not mutation_busy)
+            forget.draw()
+            btns.append(forget)
+            back_x = forget_x + forget_w + 10
+            back_w = narrow_back_w
+        else:
+            back_x = act_x + act_w + 10
+            back_w = act_w
+
+        back = Button((back_x, by, back_w, 30), 'BACK',
                       on_tap=lambda _b: self._goto('wifi'), font=display.font_xs,
                       enabled=not busy)
-        act.draw()
         back.draw()
-        btns += [act, back]
+        btns.append(back)
         self._buttons = btns
+
+    def _begin_forget_confirmation(self):
+        if self._wifi_mutation_busy():
+            return
+        net = self.selected
+        if net is None or not net.saved:
+            return
+        self._forget_confirm = True
+        self.status = f'Forget {net.ssid}? The saved password will be removed.'
+        self.status_kind = 'info'
+
+    def _cancel_forget(self):
+        self._forget_confirm = False
+        self.status = ''
+        self.status_kind = 'info'
+
+    def _confirm_forget(self):
+        if self._wifi_mutation_busy():
+            return
+        net = self.selected
+        self._forget_confirm = False
+        if net is None:
+            return
+        self.action_job = wifi.forget_async(net)
+        self.status = 'Forgetting network...'
+        self.status_kind = 'info'
 
     @staticmethod
     def _detail_color(label, value, net):

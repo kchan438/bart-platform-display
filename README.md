@@ -32,7 +32,8 @@ bart-platform-display/
 │       ├── keyboard.py             # on-screen keyboard
 │       └── settings.py            # Wi-Fi, API-key, and System panel
 ├── deploy/
-│   └── polkit/                    # minimal NetworkManager/reboot authorization
+│   ├── polkit/                    # minimal NetworkManager/reboot authorization
+│   └── systemd/                   # persistent journald storage drop-in
 ├── docs/product/                  # implementation-ready product requirements
 ├── tests/                         # Wi-Fi lifecycle regression tests
 ├── config.json                     # station, platform, API key
@@ -207,6 +208,36 @@ To roll the reboot permission back:
 ```bash
 sudo rm /etc/polkit-1/rules.d/51-bart-platform-display-reboot.rules
 sudo systemctl restart polkit
+```
+
+### Persistent Wi-Fi failure logs (journald)
+
+Every failed scan, connect, disconnect, and forget prints a `[wifi] ...`
+line to stderr, which systemd captures in the journal
+(`journalctl -u bart-platform-display`). On a default Raspberry Pi OS image,
+`journald` only keeps logs in a `tmpfs` ring buffer, so that history is lost
+on every reboot — including the reboot that often follows a Wi-Fi failure.
+Install the repository's drop-in to keep it on disk instead, capped so it
+cannot fill the SD card:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  deploy/systemd/journald-bart-platform-display.conf \
+  /etc/systemd/journald.conf.d/
+sudo systemctl restart systemd-journald
+```
+
+Confirm persistent storage is active:
+
+```bash
+journalctl --disk-usage
+```
+
+To roll it back:
+
+```bash
+sudo rm /etc/systemd/journald.conf.d/journald-bart-platform-display.conf
+sudo systemctl restart systemd-journald
 ```
 
 ---
@@ -418,6 +449,8 @@ sudo systemctl restart bart-platform-display
 | Wi-Fi action shows `Not authorized` | Reinstall the scoped PolicyKit rule above and confirm the required `nmcli general permissions` rows report `yes` |
 | A correct Wi-Fi password still times out | Run `journalctl -u bart-platform-display -u NetworkManager --since "-5 minutes" --no-pager` and inspect the terminal NetworkManager reason |
 | Wi-Fi disconnects after a successful connection | Run `journalctl -u bart-platform-display -u NetworkManager --since "-30 minutes" --no-pager`. The continuous supervisor records sanitized `phase`, error `code`, and NetworkManager reason number; manual scans also record `[wifi] device=... state=... reason=... active_profile=... autoconnect_off=...`. These lines exclude SSIDs, profile names, UUIDs, and passwords. |
+| A Wi-Fi failure needs investigating after a reboot | By default `journalctl` history is volatile and does not survive a reboot. Install the persistent journald drop-in above, then re-check with `journalctl -u bart-platform-display --since "-1 day" --no-pager \| grep '\[wifi\]'`. |
+| A saved network keeps failing for no clear reason | Open the network's detail screen and tap **Forget**, then reconnect with the password to rule out a stale/incorrect saved credential. |
 | pip pygame build fails | Use system pygame: `sudo apt install python3-pygame` and create venv with `--system-site-packages` |
 
 ---
