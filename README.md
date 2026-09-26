@@ -418,7 +418,27 @@ journalctl -u bart-platform-display -f
 
 ## 7 — Configuration
 
-Edit `config.json` to change the station or other settings:
+Tap the station name at the top left to open an alphabetical station dropdown.
+Use **Prev 4 / Next 4** to browse a page at a time, drag the scrollbar, tap its
+up/down buttons, or swipe the list. Pick a
+station, then a valid platform and **Apply**. To change only the platform, tap
+**Platform #** at the bottom right. That opens the current station's platform
+choices directly. The current choice is highlighted in yellow.
+
+**Cancel**, tapping outside the dropdown, or tapping its header control again
+closes it without saving. **Back** returns from a new station's platform choices
+to the station list. Loading errors have a **Retry** button. Choices save together
+to `config.json`, survive restarts, and immediately refresh departures; old
+requests cannot populate the board after a selection change. Platform choices
+come from station metadata, so a platform need not have an imminent departure to
+appear. No platform is invented if metadata is unavailable.
+
+Desktop trials can set `BART_CONFIG_PATH` alongside `BART_DEV=1` to an existing
+copy of `config.json`. This keeps test selections separate from device settings;
+the override is ignored outside development mode. Desktop/API tests do not prove
+Pi touch behavior.
+
+You can also edit `config.json` to change the station or other settings:
 
 ```json
 {

@@ -1,7 +1,10 @@
 """Render the main BART departure board."""
 
 from datetime import datetime
+import os
 from zoneinfo import ZoneInfo
+
+import pygame
 
 from . import config, display
 from .display import C, PAD, W, H, blit_left, blit_right, divider, truncate
@@ -11,6 +14,28 @@ LA_TZ = ZoneInfo('America/Los_Angeles')
 ROW_H = 50  # height of each departure row (px)
 
 _metrics = {}
+
+
+def station_rect():
+    """Keep the clock out of the station's touch target."""
+    clock_width = display.font_xs.size('00:00:00 PM')[0]
+    return pygame.Rect(PAD, 0, W - 2 * PAD - clock_width - 8, 34)
+
+
+def station_tapped(event):
+    return (event.get('kind') == 'release' and event.get('tap')
+            and station_rect().collidepoint(event['x'], event['y']))
+
+
+def platform_rect():
+    """The existing footer label opens platform choices for the active station."""
+    width = display.font_xs.size(f'PLATFORM {config.get_platform()}')[0] + 24
+    return pygame.Rect(W - PAD - width, H - 36, width, 36)
+
+
+def platform_tapped(event):
+    return (event.get('kind') == 'release' and event.get('tap')
+            and platform_rect().collidepoint(event['x'], event['y']))
 
 
 def _time_min_widths():
@@ -31,7 +56,17 @@ def render(rows, loading, blink):
 
     # Station name — top left, clock — top right, both dim orange.
     clock_str = datetime.now(LA_TZ).strftime('%I:%M:%S %p')
-    blit_left(config.get_station_name(), fx, C['dim'], PAD, y)
+    rect = station_rect()
+    if 'station_font' not in _metrics:
+        _metrics['station_font'] = pygame.font.Font(os.path.join(
+            config.PROJECT_ROOT, 'fonts', 'PressStart2P-Regular.ttf'), 14)
+    station_font = _metrics['station_font']
+    name = truncate(config.get_station_name(), station_font, rect.width - 20)
+    blit_left(name, station_font, C['dim'], PAD, y + 2)
+    # Small chevron makes the station selector discoverable.
+    pygame.draw.lines(screen, C['dim'], False,
+                      [(rect.right - 13, y + 5), (rect.right - 8, y + 10),
+                       (rect.right - 3, y + 5)], 2)
     _, ch = blit_right(clock_str, fx, C['dim'], W - PAD, y)
     y += ch + 8
 
@@ -78,4 +113,8 @@ def render(rows, loading, blink):
     footer_y = H - 26
     divider(footer_y - 4)
     blit_left('BART', fx, C['ghost'], PAD, footer_y)
-    blit_right(f'PLATFORM {config.get_platform()}', fx, C['white'], W - PAD, footer_y)
+    blit_right(f'PLATFORM {config.get_platform()}', fx, C['white'], W - PAD - 22, footer_y)
+    pygame.draw.lines(screen, C['white'], False,
+                      [(W - PAD - 14, footer_y + 5),
+                       (W - PAD - 9, footer_y + 10),
+                       (W - PAD - 4, footer_y + 5)], 2)

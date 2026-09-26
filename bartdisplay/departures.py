@@ -19,14 +19,16 @@ _BART_URL = 'https://api.bart.gov/api/etd.aspx'
 _lock = threading.Lock()
 _rows = []
 _loading = True
+_generation = 0
+_wake = threading.Event()
 
 
-def _fetch():
+def _fetch(selection=None):
     """Call the BART ETD API and return sorted departure rows for the platform."""
-    platform = config.get_platform()
+    station, platform = selection or config.get_selection()
     resp = requests.get(_BART_URL, params={
         'cmd':  'etd',
-        'orig': config.get_station(),
+        'orig': station,
         'key':  config.get_api_key(),
         'json': 'y',
     }, timeout=10)
@@ -66,14 +68,28 @@ def _fetch():
     return rows
 
 
+def refresh():
+    """Discard old rows and wake the worker after applying a new selection."""
+    global _rows, _loading, _generation
+    with _lock:
+        _generation += 1
+        _rows = []
+        _loading = True
+        _wake.set()
+
+
 def _poll_once():
     global _rows, _loading
+    with _lock:
+        generation = _generation
+        selection = config.get_selection()
     started = time.monotonic()
     try:
-        new_rows = _fetch()
+        new_rows = _fetch(selection)
         with _lock:
-            _rows = new_rows
-            _loading = False
+            if generation == _generation and selection == config.get_selection():
+                _rows = new_rows
+                _loading = False
         network_diagnostics.record(
             'bart_request', ok=True, error_kind='none',
             duration_ms=round((time.monotonic() - started) * 1000),
@@ -87,14 +103,16 @@ def _poll_once():
             duration_ms=round((time.monotonic() - started) * 1000),
         )
         with _lock:
-            _loading = False
+            if generation == _generation and selection == config.get_selection():
+                _loading = False
         print('[fetch error] Unable to retrieve departures', file=sys.stderr)
 
 
 def _loop():
     while True:
+        _wake.clear()
         _poll_once()
-        time.sleep(config.get_refresh_interval())
+        _wake.wait(config.get_refresh_interval())
 
 
 def start():
