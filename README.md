@@ -210,6 +210,19 @@ sudo rm /etc/polkit-1/rules.d/51-bart-platform-display-reboot.rules
 sudo systemctl restart polkit
 ```
 
+### Automatic network diagnostic logs
+
+The app automatically saves a bounded, persistent network history on the Pi,
+including Wi-Fi state/reasons and recovery attempts, periodic signal/power
+readings, and BART request outcomes. It survives normal Pi reboots without
+installing a system configuration file. After updating, restart the display to
+begin collection; earlier incidents cannot be recovered by the new logger.
+
+Logs are in `~/.local/state/bart-platform-display/diagnostics/` under the service
+user, capped at approximately 16 MiB. Network names, passwords, IP addresses and
+API keys are excluded. See [install, export, and diagnosis instructions](docs/network-diagnostics.md)
+for collecting a ZIP when the Pi comes home and for measurement limitations.
+
 ### Persistent Wi-Fi failure logs (journald)
 
 Every failed scan, connect, disconnect, and forget prints a `[wifi] ...`
@@ -217,14 +230,16 @@ line to stderr, which systemd captures in the journal
 (`journalctl -u bart-platform-display`). On a default Raspberry Pi OS image,
 `journald` only keeps logs in a `tmpfs` ring buffer, so that history is lost
 on every reboot — including the reboot that often follows a Wi-Fi failure.
-Install the repository's drop-in to keep it on disk instead, capped so it
+The automatic diagnostic files above already persist. For additional raw
+system journal evidence, install this drop-in to keep it on disk, capped so it
 cannot fill the SD card:
 
 ```bash
-sudo install -o root -g root -m 0644 \
+sudo install -D -o root -g root -m 0644 \
   deploy/systemd/journald-bart-platform-display.conf \
-  /etc/systemd/journald.conf.d/
+  /etc/systemd/journald.conf.d/journald-bart-platform-display.conf
 sudo systemctl restart systemd-journald
+sudo journalctl --flush
 ```
 
 Confirm persistent storage is active:

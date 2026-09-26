@@ -5,11 +5,12 @@ the swipe-down settings panel. On the Pi, touch comes from the XPT2046 evdev
 device; with BART_DEV=1 the mouse stands in so the UI can be built on a desktop.
 """
 
+import atexit
 import sys
 
 import pygame
 
-from bartdisplay import board, config, departures, display, wifi
+from bartdisplay import board, config, departures, display, network_diagnostics, wifi
 from bartdisplay.touch import (
     GestureRecognizer,
     RawEvent,
@@ -40,6 +41,8 @@ def _dev_mouse_events():
 
 
 def main():
+    network_diagnostics.start()
+    atexit.register(network_diagnostics.stop)
     config.load()
     display.init()
     departures.start()
