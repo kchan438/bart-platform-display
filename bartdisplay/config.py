@@ -12,6 +12,9 @@ import threading
 # config.json lives at the project root, one level above this package.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(PROJECT_ROOT, 'config.json')
+# Desktop trials can save selections without changing the device configuration.
+if os.environ.get('BART_DEV') == '1':
+    CONFIG_PATH = os.environ.get('BART_CONFIG_PATH', CONFIG_PATH)
 
 _lock = threading.Lock()
 _cfg = {}
@@ -31,7 +34,18 @@ def _get(key, default=None):
         return _cfg.get(key, default)
 
 
-# --- Departure / display settings (read once at startup is fine) --------------
+# --- Departure / display settings (read live) --------------------------------
+def get_selection():
+    """Read station and platform together for a consistent fetch target."""
+    with _lock:
+        return _cfg.get('station'), str(_cfg.get('platform'))
+
+
+def set_selection(station, name, platform):
+    """Persist the complete selection in one atomic file replacement."""
+    _write_fields({'station': station, 'station_name': name, 'platform': str(platform)})
+
+
 def get_station():
     return _get('station')
 
@@ -88,15 +102,19 @@ def set_show_touch_cursor(enabled):
 
 
 def _write_field(key, value):
+    _write_fields({key: value})
+
+
+def _write_fields(fields):
     """Read-modify-write config.json so unrelated fields are never dropped."""
     with _lock:
         # Re-read from disk to avoid clobbering external edits, then update.
         with open(CONFIG_PATH) as f:
             disk = json.load(f)
-        disk[key] = value
+        disk.update(fields)
         tmp = CONFIG_PATH + '.tmp'
         with open(tmp, 'w') as f:
             json.dump(disk, f, indent=2)
             f.write('\n')
         os.replace(tmp, CONFIG_PATH)
-        _cfg[key] = value
+        _cfg.update(fields)

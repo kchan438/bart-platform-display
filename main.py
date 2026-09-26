@@ -18,6 +18,7 @@ from bartdisplay.touch import (
     should_open_panel,
 )
 from bartdisplay.ui.settings import SettingsPanel
+from bartdisplay.ui.station_picker import StationPicker
 
 FPS_IDLE = 10   # board-only: spare the Pi Zero W's CPU
 FPS_ACTIVE = 30  # while the panel is open/animating: responsive touch
@@ -54,6 +55,7 @@ def main():
         reader = TouchReader().start()
 
     panel = SettingsPanel()
+    picker = StationPicker()
     clock = pygame.time.Clock()
     blink = True
     blink_ms = 0
@@ -70,7 +72,7 @@ def main():
         show_cursor = config.get_show_touch_cursor()
         cursor_recent = show_cursor and cursor_pos is not None and (
             cursor_active or now - cursor_last < CURSOR_LINGER)
-        fps = FPS_ACTIVE if (panel.is_active() or cursor_recent) else FPS_IDLE
+        fps = FPS_ACTIVE if (panel.is_active() or picker.active or cursor_recent) else FPS_IDLE
         dt = clock.tick(fps)
 
         blink_ms += dt
@@ -97,12 +99,19 @@ def main():
             if raw.kind == 'down':
                 print(f'[touch] down at {raw.x},{raw.y}', file=sys.stderr)
             for sem in gestures.feed(raw):
-                if panel.is_active():
+                if picker.active:
+                    picker.handle(sem)
+                elif panel.is_active():
                     panel.handle(sem)
+                elif board.station_tapped(sem):
+                    picker.open()
+                elif board.platform_tapped(sem):
+                    picker.open_platforms()
                 elif should_open_panel(sem):
                     panel.open()
 
         panel.update(dt)
+        picker.update()
         if panel.request_service_restart:
             print('[system] display service restart requested', file=sys.stderr)
             running = False  # systemd Restart=always relaunches the display
@@ -111,6 +120,7 @@ def main():
         rows, loading = departures.snapshot()
         board.render(rows, loading, blink)
         panel.render()
+        picker.render()
         if cursor_recent:
             display.draw_cursor(*cursor_pos, active=cursor_active)
         display.present()
