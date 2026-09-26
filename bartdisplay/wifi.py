@@ -22,6 +22,8 @@ import threading
 import time
 import uuid as uuidlib
 
+from . import network_diagnostics
+
 
 _HAVE_NMCLI = shutil.which('nmcli') is not None
 _HAVE_BUSCTL = shutil.which('busctl') is not None
@@ -288,6 +290,7 @@ class WifiJob:
         self.partial = False
         self.completed_at = 0.0
         self._managed = False
+        network_diagnostics.record('wifi_operation_start', operation=kind)
 
     def set_status(self, status):
         self.status = status
@@ -301,6 +304,8 @@ class WifiJob:
             networks=None,
             partial=False,
             completed_at=0.0):
+        network_diagnostics.record('wifi_operation_end', operation=self.kind,
+                                   ok=ok, code=code, partial=partial)
         self.ok = ok
         self.message = message
         self.status = message
@@ -2950,6 +2955,11 @@ class ConnectionSupervisor:
             )
             self._history.append(self._status.copy())
             del self._history[:-12]
+            network_diagnostics.record(
+                'wifi_supervisor', phase=phase, code=code or 'ok',
+                reason=reason_code, retry_count=self._retry_count,
+                exhausted=self._recovery_exhausted,
+            )
         print(
             f'[wifi] supervisor phase={phase} code={code or "ok"} '
             f'reason={reason_code}',
@@ -3359,6 +3369,15 @@ class ConnectionSupervisor:
         with self._lock:
             if observation_generation != self._generation:
                 return self._status.copy()
+        if observe_code != 'busy':
+            network_diagnostics.record(
+                'wifi_observation', heartbeat=60,
+                state=_leading_int(active.state) if active else -1,
+                reason=_leading_int(active.reason) if active else -1,
+                query_ok=bool(active and active.query_ok), has_ipv4=bool(address),
+                code=(active.error_code if active and not active.query_ok
+                      else observe_code) or 'ok',
+            )
         if observe_code == 'busy':
             return self.snapshot()
         if active is None:

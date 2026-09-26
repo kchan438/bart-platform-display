@@ -12,7 +12,7 @@ import time
 
 import requests
 
-from . import config
+from . import config, network_diagnostics
 
 _BART_URL = 'https://api.bart.gov/api/etd.aspx'
 
@@ -66,19 +66,34 @@ def _fetch():
     return rows
 
 
-def _loop():
+def _poll_once():
     global _rows, _loading
+    started = time.monotonic()
+    try:
+        new_rows = _fetch()
+        with _lock:
+            _rows = new_rows
+            _loading = False
+        network_diagnostics.record(
+            'bart_request', ok=True, error_kind='none',
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+    except Exception as exc:
+        # Never persist the request URL, which includes the API key.
+        response = getattr(exc, 'response', None)
+        network_diagnostics.record(
+            'bart_request', ok=False, error_kind=type(exc).__name__,
+            http_status=getattr(response, 'status_code', None),
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+        with _lock:
+            _loading = False
+        print('[fetch error] Unable to retrieve departures', file=sys.stderr)
+
+
+def _loop():
     while True:
-        try:
-            new_rows = _fetch()
-            with _lock:
-                _rows = new_rows
-                _loading = False
-        except Exception as exc:
-            # Keep previous rows; stop spinner so the screen isn't stuck on LOADING.
-            with _lock:
-                _loading = False
-            print(f'[fetch error] {exc}', file=sys.stderr)
+        _poll_once()
         time.sleep(config.get_refresh_interval())
 
 
