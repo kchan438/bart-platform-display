@@ -38,10 +38,12 @@ class FakeKeyboard:
             initial='',
             password=False,
             on_submit=None,
-            on_cancel=None):
+            on_cancel=None,
+            numeric=False):
         self.title = title
         self.initial = initial
         self.password = password
+        self.numeric = numeric
         self.on_submit = on_submit
         self.on_cancel = on_cancel
 
@@ -1706,6 +1708,126 @@ class WifiUiStateTests(unittest.TestCase):
         })
 
         self.assertEqual(panel.scroll, 0)
+
+
+class TailscalePanelTests(unittest.TestCase):
+    def test_disconnect_requires_confirmation_and_can_be_cancelled(self):
+        from bartdisplay import tailscale_control as ts
+        panel = SettingsPanel()
+        panel.ts_unlocked = True
+        panel.ts_snapshot = ts.Status('Running', True)
+        with mock.patch.object(ts, 'Job') as job:
+            panel._change_tailscale(False)
+            job.assert_not_called()
+            panel._toggle_tailscale()
+            self.assertTrue(panel.ts_confirm)
+            job.assert_not_called()
+            panel._cancel_tailscale()
+            self.assertFalse(panel.ts_confirm)
+            panel._toggle_tailscale()
+            panel._change_tailscale(False)
+            job.assert_called_once_with(False)
+            panel._change_tailscale(False)
+            job.assert_called_once()
+
+    def test_connect_reuses_login_but_login_required_disables_toggle(self):
+        from bartdisplay import tailscale_control as ts
+        panel = SettingsPanel()
+        panel.ts_unlocked = True
+        with mock.patch.object(ts, 'Job') as job:
+            panel.ts_snapshot = ts.Status('NeedsLogin')
+            panel._toggle_tailscale()
+            job.assert_not_called()
+            panel.ts_snapshot = ts.Status('Stopped')
+            panel._toggle_tailscale()
+            job.assert_called_once_with(True)
+
+    def test_completed_action_updates_status_even_after_panel_is_closed(self):
+        from bartdisplay import tailscale_control as ts
+        panel = SettingsPanel()
+        panel.ts_unlocked = True
+        status = ts.Status('Stopped')
+        panel.ts_job = types.SimpleNamespace(
+            done=True, action=True, result=ts.Result(status, message='Disconnected'))
+        panel._update_tailscale(16)
+        self.assertIs(panel.ts_snapshot, status)
+        self.assertEqual(panel.ts_message, 'Disconnected')
+        self.assertIsNone(panel.ts_job)
+
+    def test_refresh_does_not_race_confirmation_or_pending_job(self):
+        from bartdisplay import tailscale_control as ts
+        panel = SettingsPanel()
+        panel.ts_unlocked = True
+        panel.view = 'tailscale'
+        panel.state = 'OPEN'
+        panel.ts_confirm = True
+        with mock.patch.object(ts, 'Job') as job:
+            panel._update_tailscale(10_000)
+            job.assert_not_called()
+            panel._cancel_tailscale()
+            panel._update_tailscale(16)
+            job.assert_called_once_with()
+            panel._refresh_tailscale()
+            job.assert_called_once()
+
+
+class TailscalePinGateTests(unittest.TestCase):
+    def test_entering_page_requires_masked_pin_before_reading_status(self):
+        from bartdisplay import tailscale_control as ts
+        panel = SettingsPanel()
+        with mock.patch.object(ts, 'Job') as job:
+            panel._goto('tailscale')
+            self.assertEqual(panel.view, 'tailscale_locked')
+            self.assertTrue(panel.keyboard.password)
+            self.assertTrue(panel.keyboard.numeric)
+            self.assertFalse(panel.ts_unlocked)
+            panel._toggle_tailscale()
+            panel._change_tailscale(True)
+            job.assert_not_called()
+
+    def test_wrong_pin_never_unlocks_and_success_does(self):
+        from bartdisplay import admin_pin, tailscale_control as ts
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'tailscale_locked'
+        panel.ts_pin_job = types.SimpleNamespace(
+            done=True, result=admin_pin.Verification(False, 'Incorrect PIN'))
+        panel._update_tailscale(0)
+        self.assertFalse(panel.ts_unlocked)
+        self.assertEqual(panel.view, 'tailscale_locked')
+        self.assertEqual(panel.ts_pin_message, 'Incorrect PIN')
+        panel.ts_pin_job = types.SimpleNamespace(
+            done=True, result=admin_pin.Verification(True))
+        with mock.patch.object(ts, 'Job', return_value=types.SimpleNamespace(done=False)):
+            panel._update_tailscale(0)
+        self.assertTrue(panel.ts_unlocked)
+        self.assertEqual(panel.view, 'tailscale')
+
+    def test_close_navigation_and_inactivity_relock_page(self):
+        for action in ('close', 'navigate', 'idle'):
+            with self.subTest(action=action):
+                panel = SettingsPanel()
+                panel.state = 'OPEN'
+                panel.view = 'tailscale'
+                panel.ts_unlocked = True
+                if action == 'close':
+                    panel.close()
+                elif action == 'navigate':
+                    panel._goto('menu')
+                else:
+                    panel._update_tailscale(60_000)
+                self.assertFalse(panel.ts_unlocked)
+                self.assertNotEqual(panel.view, 'tailscale')
+
+    def test_abandoned_verification_cannot_unlock_a_later_visit(self):
+        panel = SettingsPanel()
+        panel.state = 'OPEN'
+        panel.view = 'tailscale_locked'
+        panel.ts_pin_job = types.SimpleNamespace(done=False)
+        panel._cancel_tailscale_pin()
+        self.assertIsNone(panel.ts_pin_job)
+        panel._goto('tailscale')
+        self.assertFalse(panel.ts_unlocked)
 
 
 if __name__ == '__main__':

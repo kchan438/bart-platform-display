@@ -26,6 +26,13 @@ _SYMBOL_ROWS = [
     list('_#%~<>|\\{}^`') + ['BKSP'],
     ['ABC', 'SPACE', 'HIDE', 'DONE'],
 ]
+_NUMBER_ROWS = [
+    ['1', '2', '3'],
+    ['4', '5', '6'],
+    ['7', '8', '9'],
+    ['HIDE', '0', 'BKSP'],
+    ['DONE'],
+]
 
 _WEIGHTS = {'SHIFT': 1.6, 'BKSP': 1.6, 'SYM': 1.6, 'ABC': 1.6,
             'HIDE': 2.0, 'DONE': 2.0, 'SPACE': 4.4}
@@ -43,10 +50,11 @@ _PASSWORD_TOGGLE_W = 108
 
 class Keyboard:
     def __init__(self, title, initial='', password=False,
-                 on_submit=None, on_cancel=None):
+                 on_submit=None, on_cancel=None, numeric=False):
         self.title = title
         self.text = initial
         self.password = password
+        self.numeric = numeric
         self.reveal = False
         self.on_submit = on_submit
         self.on_cancel = on_cancel
@@ -70,10 +78,10 @@ class Keyboard:
     # -- layout -------------------------------------------------------------
     def _layout(self):
         self._keys = []
-        rows = _SYMBOL_ROWS if self._symbols else _LETTER_ROWS
+        rows = _NUMBER_ROWS if self.numeric else _SYMBOL_ROWS if self._symbols else _LETTER_ROWS
         y = _KEYS_TOP
         for row in rows:
-            weights = [_WEIGHTS.get(tok, 1.0) for tok in row]
+            weights = [1.0 if self.numeric else _WEIGHTS.get(tok, 1.0) for tok in row]
             avail = W - 2 * PAD
             unit = (avail - _KEY_GAP * (len(row) - 1)) / sum(weights)
             x = PAD
@@ -104,6 +112,9 @@ class Keyboard:
                 return
 
     def _activate(self, tok):
+        if self.numeric and tok not in ('BKSP', 'HIDE', 'DONE'):
+            if tok not in '0123456789' or len(tok) != 1 or len(self.text) >= 12:
+                return
         if tok == 'SHIFT':
             self._shift = not self._shift
         elif tok == 'SYM':
