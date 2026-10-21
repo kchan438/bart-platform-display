@@ -14,7 +14,7 @@ import time
 
 import pygame
 
-from .. import config, display, system_control, updater, wifi
+from .. import admin_pin, config, display, system_control, tailscale_control, updater, wifi
 from ..display import C, W, H, PAD
 from .keyboard import Keyboard
 from .widgets import Button, draw_signal_bars, draw_lock, draw_tag
@@ -80,6 +80,16 @@ class SettingsPanel:
         self.update_status = ''
         self.update_status_kind = 'info'
         self.update_restart_required = False
+        self.ts_snapshot = tailscale_control.Status()
+        self.ts_job = None
+        self.ts_confirm = False
+        self.ts_message = ''
+        self.ts_error = False
+        self.ts_refresh_ms = 0
+        self.ts_unlocked = False
+        self.ts_idle_ms = 0
+        self.ts_pin_job = None
+        self.ts_pin_message = ''
         self._buttons = []
         self._surf = pygame.Surface((W, H))
 
@@ -87,8 +97,12 @@ class SettingsPanel:
     def is_active(self):
         return self.state != 'CLOSED'
 
+    def checking_pin(self):
+        return self.ts_pin_job is not None
+
     def open(self):
         if self.state in ('CLOSED', 'CLOSING'):
+            self._lock_tailscale()
             self.state = 'OPENING'
             self.view = 'menu'
             self.status = ''
@@ -97,16 +111,22 @@ class SettingsPanel:
         if self._system_busy() or self._update_busy():
             return
         if self.state in ('OPEN', 'OPENING'):
+            self._lock_tailscale()
             self.state = 'CLOSING'
             self.keyboard = None
             self._scrollbar_dragging = False
 
     def _goto(self, view):
+        self._lock_tailscale()
         self.view = view
         self.status = ''
         self.status_kind = 'info'
         self._scrollbar_dragging = False
         self._forget_confirm = False
+        self.ts_confirm = False
+        if view == 'tailscale':
+            self.view = 'tailscale_locked'
+            self._prompt_tailscale_pin()
         if view == 'wifi':
             # The list is intentionally stable until the user requests a scan.
             # Restore the latest scan summary when returning from network detail.
@@ -693,6 +713,7 @@ class SettingsPanel:
         self._update_app_job()
         self._update_wifi_jobs()
         self._update_connection_supervisor()
+        self._update_tailscale(dt_ms)
 
     def animating(self):
         return self.state in ('OPENING', 'CLOSING')
@@ -702,6 +723,8 @@ class SettingsPanel:
         if not self.is_active():
             return
         kind = event.get('kind')
+        if self.view in ('tailscale', 'tailscale_locked') and kind in ('press', 'drag', 'release'):
+            self.ts_idle_ms = 0
 
         if self.keyboard is not None:
             self.keyboard.handle(event)
@@ -897,6 +920,10 @@ class SettingsPanel:
             self._render_apikey()
         elif self.view == 'system':
             self._render_system()
+        elif self.view == 'tailscale':
+            self._render_tailscale()
+        elif self.view == 'tailscale_locked':
+            self._render_tailscale_locked()
 
     # -- menu ---------------------------------------------------------------
     def _render_menu(self):
@@ -905,27 +932,186 @@ class SettingsPanel:
         # grab-handle affordance
         pygame.draw.rect(self._surf, C['dim'], (W // 2 - 20, 6, 40, 4))
 
-        wifi_btn = Button((PAD, 48, W - 2 * PAD, 50), 'WI-FI',
+        wifi_btn = Button((PAD, 48, W - 2 * PAD, 40), 'WI-FI',
                           on_tap=lambda _b: self._goto('wifi'), font=display.font_sm)
-        api_btn = Button((PAD, 104, W - 2 * PAD, 50), 'BART API KEY',
+        api_btn = Button((PAD, 94, W - 2 * PAD, 40), 'BART API KEY',
                          on_tap=lambda _b: self._goto('apikey'), font=display.font_sm)
-        system_btn = Button((PAD, 160, W - 2 * PAD, 50), 'SYSTEM',
+        ts_btn = Button((PAD, 140, W - 2 * PAD, 40), 'TAILSCALE',
+                        on_tap=lambda _b: self._goto('tailscale'),
+                        font=display.font_sm)
+        system_btn = Button((PAD, 186, W - 2 * PAD, 40), 'SYSTEM',
                             on_tap=lambda _b: self._goto('system'),
                             font=display.font_sm)
         wifi_btn.draw()
         api_btn.draw()
+        ts_btn.draw()
         system_btn.draw()
 
         cursor_on = config.get_show_touch_cursor()
         cursor_btn = Button(
-            (PAD, 218, W - 2 * PAD, 40),
+            (PAD, 232, W - 2 * PAD, 40),
             'TOUCH CURSOR: ' + ('ON' if cursor_on else 'OFF'),
             on_tap=lambda _b: self._toggle_cursor(), font=display.font_xs,
             fg=(C['arrive'] if cursor_on else C['dim']))
         cursor_btn.draw()
 
         display.blit_center('Swipe up to close', display.font_xs, C['ghost'], W // 2, H - 24)
-        self._buttons = [wifi_btn, api_btn, system_btn, cursor_btn]
+        self._buttons = [wifi_btn, api_btn, ts_btn, system_btn, cursor_btn]
+
+    # -- Tailscale ----------------------------------------------------------
+    def _lock_tailscale(self):
+        self.ts_unlocked = False
+        self.ts_idle_ms = 0
+        self.ts_confirm = False
+        # An abandoned check must never unlock a later visit to this page.
+        self.ts_pin_job = None
+        self.ts_pin_message = ''
+        if self.view in ('tailscale', 'tailscale_locked'):
+            self.view = 'menu'
+            self.keyboard = None
+            self._buttons = []
+
+    def _prompt_tailscale_pin(self):
+        if self.ts_pin_job is not None:
+            return
+        self.keyboard = Keyboard(
+            'TAILSCALE PIN', password=True, numeric=True,
+            on_submit=self._submit_tailscale_pin,
+            on_cancel=lambda: self._cancel_tailscale_pin())
+
+    def _cancel_tailscale_pin(self):
+        self.keyboard = None
+        self._goto('menu')
+
+    def _submit_tailscale_pin(self, pin):
+        if self.view != 'tailscale_locked' or self.ts_pin_job is not None:
+            return
+        # Drop the keyboard (and its text) while verification runs off-thread.
+        self.keyboard = None
+        self._buttons = []
+        self.ts_pin_message = 'Checking PIN...'
+        self.ts_pin_job = admin_pin.VerifyJob(pin)
+
+    def _render_tailscale_locked(self):
+        btns = self._header('TAILSCALE', back_to='menu')
+        display.blit_center('PIN REQUIRED', display.font_sm, C['arrive'], W // 2, 72)
+        self._draw_status(self.ts_pin_message or 'Enter PIN to open Tailscale.',
+                          C['dim'], 118, W - 2 * PAD)
+        enter = Button((PAD, 214, W - 2 * PAD, 44), 'ENTER PIN',
+                       on_tap=lambda _b: self._prompt_tailscale_pin(),
+                       font=display.font_xs, enabled=self.ts_pin_job is None)
+        enter.draw()
+        self._buttons = btns + [enter]
+
+    def _refresh_tailscale(self):
+        if self.ts_unlocked and self.ts_job is None:
+            self.ts_job = tailscale_control.Job()
+            self.ts_refresh_ms = 0
+
+    def _update_tailscale(self, dt_ms):
+        if self.ts_pin_job is not None and self.ts_pin_job.done:
+            result = self.ts_pin_job.result
+            self.ts_pin_job = None
+            if self.view == 'tailscale_locked' and self.is_active():
+                if result.ok:
+                    self.ts_unlocked = True
+                    self.ts_idle_ms = 0
+                    self.view = 'tailscale'
+                    self._buttons = []
+                    self._refresh_tailscale()
+                else:
+                    self.ts_pin_message = result.message
+        if self.view in ('tailscale', 'tailscale_locked') and self.is_active():
+            self.ts_idle_ms += dt_ms
+            if self.ts_idle_ms >= 60_000:
+                self._lock_tailscale()
+        if self.ts_job is not None and self.ts_job.done:
+            result = self.ts_job.result
+            self.ts_snapshot = result.snapshot
+            if self.ts_job.action:
+                self.ts_message = result.message
+                self.ts_error = not result.ok
+            elif result.snapshot.state != 'Checking':
+                # A refresh supersedes old success/error feedback, especially
+                # if the network or account state changed outside this panel.
+                self.ts_message = ''
+                self.ts_error = False
+            self.ts_job = None
+            self.ts_refresh_ms = 0
+        if self.view == 'tailscale' and self.is_active():
+            self.ts_refresh_ms += dt_ms
+            if self.ts_refresh_ms >= 5000 and not self.ts_confirm:
+                self._refresh_tailscale()
+
+    def _toggle_tailscale(self):
+        if not self.ts_unlocked or self.ts_job is not None or display.DEV:
+            return
+        if self.ts_snapshot.state in ('Running', 'Starting'):
+            self.ts_confirm = True
+        elif self.ts_snapshot.state == 'Stopped':
+            self._change_tailscale(True)
+
+    def _change_tailscale(self, connect):
+        if not self.ts_unlocked or self.ts_job is not None or display.DEV:
+            return
+        if not connect and not self.ts_confirm:
+            return
+        self.ts_confirm = False
+        self.ts_message = 'Connecting...' if connect else 'Disconnecting...'
+        self.ts_error = False
+        self.ts_job = tailscale_control.Job(connect)
+
+    def _cancel_tailscale(self):
+        self.ts_confirm = False
+
+    def _render_tailscale(self):
+        if not self.ts_unlocked:
+            self._render_tailscale_locked()
+            return
+        btns = self._header('TAILSCALE', back_to='menu')
+        if self.ts_confirm:
+            display.blit_center('DISCONNECT?', display.font_sm, C['white'], W // 2, 58)
+            for i, line in enumerate(('Remote SSH will disconnect.',
+                                      'Local Wi-Fi SSH stays on.',
+                                      'Your login stays saved.')):
+                display.blit_center(line, display.font_xs, C['dim'],
+                                    W // 2, 104 + i * 28)
+            cancel = Button((PAD, 208, W - 2 * PAD, 42), 'CANCEL',
+                            on_tap=lambda _b: self._cancel_tailscale(),
+                            font=display.font_xs)
+            confirm = Button((PAD, 260, W - 2 * PAD, 44), 'DISCONNECT',
+                             on_tap=lambda _b: self._change_tailscale(False),
+                             font=display.font_xs, fg=C['err'])
+            cancel.draw()
+            confirm.draw()
+            self._buttons = btns + [cancel, confirm]
+            return
+        snapshot = self.ts_snapshot
+        busy = self.ts_job is not None
+        connected = snapshot.state in ('Running', 'Starting')
+        display.blit_center(snapshot.label, display.font_sm,
+                            C['ok'] if snapshot.online and snapshot.state == 'Running'
+                            else C['arrive'], W // 2, 56)
+        display.blit_center(snapshot.address or 'No Tailscale address',
+                            display.font_xs, C['white'], W // 2, 92)
+        hostname = display.truncate(snapshot.hostname, display.font_xs, W - 2 * PAD)
+        display.blit_center(hostname, display.font_xs, C['dim'], W // 2, 120)
+        message = ('Controls disabled in preview.' if display.DEV else
+                   self.ts_message or snapshot.message or 'SSH works without RemoteViewer.')
+        self._draw_status(message, C['err'] if self.ts_error else C['dim'],
+                          155, W - 2 * PAD)
+        toggle = Button((PAD, 214, W - 2 * PAD, 44),
+                        'PLEASE WAIT' if busy else 'DISCONNECT' if connected else 'CONNECT',
+                        on_tap=lambda _b: self._toggle_tailscale(), font=display.font_xs,
+                        fg=C['arrive'] if connected else C['ok'],
+                        enabled=not busy and not display.DEV and
+                        snapshot.state in ('Running', 'Stopped', 'Starting'))
+        refresh = Button((PAD, 268, W - 2 * PAD, 38), 'REFRESH STATUS',
+                         on_tap=lambda _b: self._refresh_tailscale(),
+                         font=display.font_xs, enabled=not busy)
+        toggle.draw()
+        refresh.draw()
+        self._buttons = btns + [toggle, refresh]
 
     def _toggle_cursor(self):
         config.set_show_touch_cursor(not config.get_show_touch_cursor())

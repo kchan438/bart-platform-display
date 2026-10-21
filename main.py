@@ -22,6 +22,7 @@ from bartdisplay.ui.station_picker import StationPicker
 
 FPS_IDLE = 10   # board-only: spare the Pi Zero W's CPU
 FPS_ACTIVE = 30  # while the panel is open/animating: responsive touch
+FPS_PIN_CHECK = 5  # leave CPU time for PIN hashing while showing static feedback
 
 
 def _dev_mouse_events():
@@ -73,6 +74,8 @@ def main():
         cursor_recent = show_cursor and cursor_pos is not None and (
             cursor_active or now - cursor_last < CURSOR_LINGER)
         fps = FPS_ACTIVE if (panel.is_active() or picker.active or cursor_recent) else FPS_IDLE
+        if panel.checking_pin():
+            fps = FPS_PIN_CHECK
         dt = clock.tick(fps)
 
         blink_ms += dt
@@ -96,8 +99,6 @@ def main():
             cursor_pos = (raw.x, raw.y)
             cursor_active = raw.kind != 'up'
             cursor_last = pygame.time.get_ticks()
-            if raw.kind == 'down':
-                print(f'[touch] down at {raw.x},{raw.y}', file=sys.stderr)
             for sem in gestures.feed(raw):
                 if picker.active:
                     picker.handle(sem)

@@ -229,5 +229,26 @@ class KeyboardTests(unittest.TestCase):
         self.assertEqual(keyboard.text, 'secret')
 
 
+class NumericKeyboardTests(unittest.TestCase):
+    def test_pin_keypad_has_only_digits_delete_close_and_done(self):
+        keyboard = Keyboard('PIN', password=True, numeric=True)
+        tokens = {token for token, _rect in keyboard._keys}
+        self.assertEqual(tokens, set('0123456789') | {'BKSP', 'HIDE', 'DONE'})
+        self.assertFalse(keyboard.reveal)
+        digit_rects = [rect for token, rect in keyboard._keys if token.isdigit()]
+        self.assertTrue(all(rect.width >= 140 for rect in digit_rects))
+
+    def test_pin_preserves_leading_zero_and_rejects_letters_and_overlength(self):
+        keyboard = Keyboard('PIN', password=True, numeric=True)
+        for token in ('0', '0', '1', '2', 'a', 'SYM', 'SPACE'):
+            keyboard._activate(token)
+        self.assertEqual(keyboard.text, '0012')
+        for _ in range(20):
+            keyboard._activate('3')
+        self.assertEqual(len(keyboard.text), 12)
+        keyboard._activate('BKSP')
+        self.assertEqual(len(keyboard.text), 11)
+
+
 if __name__ == '__main__':
     unittest.main()
